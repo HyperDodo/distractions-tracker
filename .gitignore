@@ -1,6 +1,8 @@
 node_modules/
 .wrangler/
 .dev.vars
+wrangler.production.jsonc
+.backups/
 .env
 .DS_Store
 __pycache__/

@@ -1,0 +1,30 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // Copy to wrangler.production.jsonc in the repository root.
+  // This copy is ignored by Git. See docs/cloudflare-deployment.md.
+  "name": "interruption-tracker",
+  "main": "backend/worker.js",
+  "compatibility_date": "2026-06-01",
+  "workers_dev": true,
+  // Disables per-version URLs. Separate preview environments need their own protection.
+  "preview_urls": false,
+  "assets": {
+    "directory": "./frontend/public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "interruption-tracker",
+      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+      "migrations_dir": "migrations"
+    }
+  ],
+  // Keep empty for the FIRST bootstrap deployment of a NEW installation.
+  // Enable Worker-wide Access before adding its real values here:
+  // ACCESS_TEAM_DOMAIN, ACCESS_AUD, ACCESS_EMAIL.
+  // LLM_API_KEY belongs in Worker Secrets, never in this file.
+  "vars": {}
+}
