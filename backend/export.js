@@ -55,7 +55,14 @@ export async function handleExport(request, env) {
   if (url.pathname !== '/api/export' || request.method !== 'GET') return null;
   const format = url.searchParams.get('format');
   if (!['json', 'csv'].includes(format)) return Response.json({error:{code:'INVALID_FORMAT',message:'Выберите JSON или CSV'}}, {status:400, headers:{'Cache-Control':'no-store'}});
-  const settings = await env.DB.prepare('SELECT * FROM settings WHERE id=1').first();
-  const content = format === 'json' ? jsonExport(env.DB, Date.now(), settings) : csvExport(env.DB);
+  let content;
+  if (format === 'json') {
+    const settings = await env.DB.prepare(`SELECT s.id,s.timezone,s.pinned_actions_json,s.analysis_context,s.revision,s.data_revision,
+      l.provider AS llm_provider,l.base_url AS llm_base_url,l.model AS llm_model
+      FROM settings s LEFT JOIN llm_config l ON l.id=s.id WHERE s.id=1`).first();
+    content = jsonExport(env.DB, Date.now(), settings);
+  } else {
+    content = csvExport(env.DB);
+  }
   return new Response(stream(content), {headers:{'Content-Type': format === 'json' ? 'application/json; charset=utf-8' : 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="interruptions.${format}"`, 'Cache-Control':'no-store', 'X-Content-Type-Options':'nosniff'}});
 }

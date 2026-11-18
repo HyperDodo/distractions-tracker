@@ -1,4 +1,5 @@
 node_modules/
+frontend/dist/
 .wrangler/
 .dev.vars
 wrangler.production.jsonc

@@ -1,63 +1,851 @@
-import {request,send,params} from './api.js';
-import {now,day,clock,duration,calibrate,clockSkew,localInput} from './time.js';
-import {EntryWriter} from './store.js';
-const app=document.querySelector('#app');
-const kinds=['Согласование','Проблема','Координация','Сделать руками','Сам отвлёкся','Другое'];
-const reasons=['Нужны мои полномочия','У сотрудника нет полномочий','Не хватает знаний или опыта','Нет назначенного ответственного','Решение передали мне','Не знаю / другое'];
-const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let state={section:'today',settings:null,date:null,snapshot:null,revision:0,load:0,epoch:0,error:'',modal:null,stats:null,reports:[],history:[],cursor:null, reportKind:'day',recentSources:[]};
-const writer=new EntryWriter(()=>{if(!state.modal) render(); if(!writer.running && !writer.draft) refresh();});
-function error(e){ state.error=e.message; render(); }
-function dateToday(){return day(now(),state.settings?.timezone||'Europe/Moscow');}
-function tz(){return state.settings?.timezone||'Europe/Moscow';}
-function active(){return writer.draft?.entry || (writer.draft?.phase==='create'?{id:writer.draft.id,started_at:writer.draft.started_at,...writer.draft.fields}:null) || state.snapshot?.active_entry;}
-async function refresh(){
- if(!state.settings)return; const n=++state.load, epoch=state.epoch, key=[state.section,state.date,tz()].join('|'), before=performance.now();
- try {const [data, dayStats]=await Promise.all([request('/api/snapshot?'+params({date:state.date,timezone:tz()})),request('/api/stats?'+params({kind:'day',date:state.date,timezone:tz()}))]);const after=performance.now();
- if(n!==state.load||epoch!==state.epoch||key!==[state.section,state.date,tz()].join('|')||(data.data_revision??0)<state.revision)return;
- calibrate(data.server_now,before,after);state.snapshot=data;state.dayStats=dayStats.metrics;state.revision=data.data_revision??state.revision;state.error='';
- if(!writer.draft && data.active_entry) writer.adopt(data.active_entry);
- if(writer.draft?.phase==='active' && !writer.running && !writer.draft.error && !writer.draft.finish && !Object.keys(writer.draft.pending).length) { if(data.active_entry?.id===writer.draft.id) writer.draft.entry=data.active_entry; else writer.clearActive(); }
- if(!state.modal && state.section!=='settings' && !document.activeElement?.matches('input,textarea,select'))render();}catch(e){if(e.payload?.error?.code==='TIMEZONE_CHANGED' && e.payload.settings){state.settings={...state.settings,...e.payload.settings};state.load++;return refresh();}error(e);}
+import { Temporal } from '@js-temporal/polyfill';
+import { request, send } from './api.js';
+import { bounds, metrics } from './calendar.js';
+import { OfflineStore } from './offline.js';
+import { now, day, clock, duration, calibrate, clockSkew } from './time.js';
+
+const app = document.querySelector('#app');
+const kinds = ['Согласование', 'Проблема', 'Координация', 'Сделать руками', 'Сам отвлёкся', 'Другое'];
+const reasons = ['Нужны мои полномочия', 'У сотрудника нет полномочий', 'Не хватает знаний или опыта', 'Нет назначенного ответственного', 'Решение передали мне', 'Не знаю / другое'];
+const sections = [['today', 'Сегодня'], ['history', 'Журнал'], ['analysis', 'Разбор'], ['settings', 'Настройки']];
+const providers = [['', 'Встроенный OpenRouter Free'], ['openrouter', 'OpenRouter'], ['cheapai', 'CheapAI'], ['custom', 'Свой провайдер']];
+const metricLabels = {
+  started_count: 'началось', total_duration_ms: 'сумма длительностей', median_duration_ms: 'медиана',
+  short_count: 'короче пяти минут', estimated_count: 'приблизительных', missing_source: 'без источника',
+  missing_kind: 'без типа', overlaps: 'пересечений',
+};
+const reportLabels = {
+  pending: 'Выполняется', completed: 'Готово', failed: 'Ошибка',
+  unknown: 'Исход неизвестен', deleted: 'Удалён',
+};
+const escape = value => String(value ?? '').replace(/[&<>"']/g, char => ({
+  '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+}[char]));
+
+const ui = {
+  section: 'today', date: null, kind: 'day', historyLimit: 100, filters: {},
+  modal: null, draftForm: false, message: '', config: null, configError: '', configBusy: false,
+  report: null, reportBusy: false,
+};
+const reportKey = 'interruptions.report';
+let model;
+let lastServerTime;
+let configRequest;
+let reportPoll;
+let pollingReport = false;
+const store = new OfflineStore(receive);
+
+function timezone() {
+  return model?.settings?.timezone || 'Europe/Moscow';
 }
-async function loadRecentSources(){try{const d=new Date();d.setUTCDate(d.getUTCDate()+2);const response=await request('/api/entries?'+params({from:'1970-01-01',to:d.toISOString().slice(0,10),timezone:tz(),limit:100}));state.recentSources=[...new Set((response.entries||[]).map(e=>e.source_name).filter(Boolean))].slice(0,8);if(!state.modal && state.section!=='settings' && !document.activeElement?.matches('input,textarea,select'))render();}catch{/* Suggestions are optional; do not interrupt tracking. */}}
-async function loadHistory(append=false){try {const to=new Date(`${state.date}T12:00:00Z`);to.setUTCDate(to.getUTCDate()+1);const data=await request('/api/entries?'+params({from:state.date,to:to.toISOString().slice(0,10),timezone:tz(),limit:100,cursor:append?state.cursor:null,source:state.source,kind:state.filterKind,q:state.query}));state.history=append?[...state.history,...data.entries]:data.entries;state.cursor=data.next_cursor;render();}catch(e){if(e.payload?.error?.code==='TIMEZONE_CHANGED' && e.payload.settings){state.settings={...state.settings,...e.payload.settings};state.load++;refresh();return loadHistory();}error(e);}}
-async function loadAnalysis(){try {const [stats,reports]=await Promise.all([request('/api/stats?'+params({kind:state.reportKind,date:state.date,timezone:tz()})),request('/api/reports?'+params({kind:state.reportKind,date:state.date}))]);state.stats=stats;state.reports=reports.reports||[];render();}catch(e){if(e.payload?.error?.code==='TIMEZONE_CHANGED' && e.payload.settings){state.settings={...state.settings,...e.payload.settings};state.load++;refresh();return loadAnalysis();}error(e);}}
-function entryList(entries){if(!entries?.length)return '<p class="muted">Нет записей</p>';return entries.map(e=>`<button class="entry" data-edit="${esc(e.id)}"><span><strong>${esc(e.source_name||'Не указано')}</strong><small>${esc(e.kind||'Не указано')}${e.note?' · '+esc(e.note):''}</small></span><span>${clock(e.started_at,tz())} · ${e.ended_at==null?'идёт':duration(e.ended_at-e.started_at)}</span></button>`).join('');}
-function timer(){const e=active(), draft=writer.draft; if(draft?.status===409 && draft.serverActive) return `<div class="card hero"><p class="eyebrow">На другом устройстве уже идёт обращение</p><h1>${esc(draft.serverActive.source_name||'Источник не указан')}</h1><p>Началось в ${clock(draft.serverActive.started_at,tz())}. Ваш черновик остался отдельно.</p></div>`; if(!e)return `<div class="card hero"><p class="eyebrow">Входящие и отвлечения</p><h1>Что происходит сейчас?</h1><p class="muted">Одно касание — и обращение записано.</p><button class="primary big" id="start">Отвлекли</button><button class="secondary" id="manual">Записать прошедшее</button>${(state.settings.pinned_actions||[]).length?`<div class="chips"><span class="muted">Быстрые действия</span>${state.settings.pinned_actions.map((p,i)=>`<button class="chip" data-pinned="${i}">${esc(p.label)}</button>`).join('')}</div>`:''}</div>`;
- const fields={...e,...draft?.fields}; const warn=now()-e.started_at>=7200000||day(e.started_at,tz())!==dateToday();
- return `<div class="card hero"><p class="eyebrow">Сейчас идёт</p><h1 class="timer" data-timer="${e.started_at}">${duration(now()-e.started_at)}</h1><p class="muted">Началось в ${clock(e.started_at,tz())} · ${esc(fields.source_name||'Источник не указан')}</p>${warn?'<p class="warning">Ещё идёт? Таймер не остановится автоматически.</p>':''}<div class="row"><button class="primary" id="finish" ${draft?.finish?'disabled':''}>${draft?.finish?'Завершаю…':'Завершить'}</button><button class="secondary" id="switch" ${draft?.finish?'disabled':''}>Завершить и начать новое</button></div><div class="chips">${kinds.map(k=>`<button class="chip ${fields.kind===k?'selected':''}" data-kind="${esc(k)}">${esc(k)}</button>`).join('')}</div><button class="secondary" id="details">Добавить детали</button></div>`;}
-function today(){const entries=state.snapshot?.entries||[];return `${timer()}<div class="row section-title"><div><p class="eyebrow">Ваш журнал</p><h2>За выбранный день</h2></div><input aria-label="Дата" type="date" id="date" value="${esc(state.date)}"></div><div class="card"><div class="stats"><div class="stat"><strong>${state.dayStats?.started_count??0}</strong><span>началось</span></div><div class="stat"><strong>${duration(state.dayStats?.total_duration_ms||0)}</strong><span>сумма длительностей</span></div></div>${entryList(entries)}</div><button class="secondary" id="daynote">Контекст дня</button>`;}
-function history(){return `<div class="section-title"><p class="eyebrow">История</p><h1>Журнал</h1></div><div class="card"><div class="form-grid"><label class="field">Дата<input type="date" id="date" value="${esc(state.date)}"></label><label class="field">Источник<input id="filter-source" value="${esc(state.source||'')}"></label><label class="field">Тип<select id="filter-kind"><option value="">Все</option>${kinds.map(k=>`<option ${state.filterKind===k?'selected':''}>${esc(k)}</option>`).join('')}</select></label><label class="field">Поиск по заметке<input id="filter-query" value="${esc(state.query||'')}"></label></div><div class="row"><button class="secondary" id="filter">Применить</button><button class="secondary" id="manual">Записать прошедшее</button></div></div><div class="card">${entryList(state.history)}${state.cursor?'<button class="secondary" id="more">Загрузить ещё</button>':''}</div>`;}
-function analysis(){const s=state.stats||{};return `<div class="section-title"><p class="eyebrow">Взгляд со стороны</p><h1>Разбор</h1></div><div class="card"><div class="row"><select id="report-kind"><option value="day" ${state.reportKind==='day'?'selected':''}>День</option><option value="week" ${state.reportKind==='week'?'selected':''}>Неделя</option></select><input type="date" id="date" value="${esc(state.date)}"></div><div class="stats">${Object.entries(s.metrics||s.stats||{}).filter(([k,v])=>['started_count','total_duration_ms','median_duration_ms','short_count','estimated_count','missing_source','missing_kind','overlaps'].includes(k)&&typeof v==='number').map(([k,v])=>`<div class="stat"><strong>${esc(k.endsWith('_ms')?duration(v):v)}</strong><span>${esc(({started_count:'началось',total_duration_ms:'сумма длительностей',median_duration_ms:'медиана',short_count:'короче пяти минут',estimated_count:'приблизительных',missing_source:'без источника',missing_kind:'без типа',overlaps:'пересечений'})[k])}</span></div>`).join('')||'<p class="muted">Числовая сводка загружается.</p>'}</div><p class="muted">${esc((s.warnings||[]).join(' · '))}</p><button class="primary" id="analyze">Разобрать</button>${state.reportStatus?`<p class="muted">Состояние последнего запроса: ${esc(state.reportStatus)}. При неизвестном исходе оплата возможна; новый запуск требует отдельного действия.</p>`:''}<p class="muted">Каждый запуск может оплачиваться поставщику модели.</p></div><div class="card"><h2>Отчёты</h2>${state.reports.length?state.reports.map(r=>`<div class="report"><strong>${esc(r.status)}</strong> · ${esc(r.model||'')}<p>${esc(typeof r.result==='string'?r.result:JSON.stringify(r.result||r.result_json||''))}</p></div>`).join(''):'<p class="muted">Отчётов пока нет</p>'}</div>`;}
-function settings(){let s=state.settings||{};return `<div class="section-title"><p class="eyebrow">Приложение</p><h1>Настройки</h1></div><form class="card" id="settings-form"><div class="form-grid"><label class="field">Часовой пояс<input name="timezone" value="${esc(s.timezone)}" required></label><label class="field">Поставщик<select name="llm_provider"><option value="openrouter" ${s.llm_provider==='openrouter'?'selected':''}>OpenRouter</option><option value="openai_compatible" ${s.llm_provider==='openai_compatible'?'selected':''}>OpenAI-compatible</option></select></label><label class="field">Base URL<input type="url" name="llm_base_url" value="${esc(s.llm_base_url)}"></label><label class="field">Модель<input name="llm_model" value="${esc(s.llm_model||'')}"></label></div><label class="field">Закреплённые действия <small>По одному на строке: подпись | источник | тип</small><textarea name="pinned_actions_text" placeholder="Глеб · согласование | Глеб | Согласование">${esc((s.pinned_actions||[]).map(p=>[p.label,p.source_name||'',p.kind||''].join(' | ')).join('\n'))}</textarea></label><label class="field">Рабочая роль<textarea name="analysis_context">${esc(s.analysis_context||'')}</textarea></label><p class="muted">Ключ ${s.has_key?'настроен':'не настроен'}. Добавьте его через Cloudflare Worker Secrets; он не сохраняется в браузере.</p><div class="row"><button class="primary">Сохранить</button><button class="secondary" type="button" id="test-model">Проверить модель</button></div></form><div class="card"><h2>Выгрузка</h2><div class="row"><a class="secondary" href="/api/export?format=json">Скачать JSON</a><a class="secondary" href="/api/export?format=csv">Скачать CSV</a></div></div>`;}
-function form(entry=null,manual=false){const fixedEnd=manual&&state.date!==dateToday()?new Date(`${state.date}T${localInput(now()).slice(11)}`).getTime():now();const start=entry?.started_at??fixedEnd-5*60000,end=entry?.ended_at??fixedEnd;return `<div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><form class="modal-card" id="entry-form"><div class="row"><h2 id="modal-title">${manual?'Прошедшее обращение':'Детали обращения'}</h2><button type="button" class="secondary" id="close">Закрыть</button></div><div class="form-grid">${manual||entry?.ended_at!=null?`<label class="field">Начало<input type="datetime-local" name="started_at" value="${localInput(start)}" required></label><label class="field">Окончание<input type="datetime-local" name="ended_at" value="${localInput(end)}" required></label><label class="field">Длительность, минут<input type="number" min="0" max="10080" name="minutes" value="${Math.round((end-start)/60000)}"></label><label class="field">Считать от<select name="anchor"><option value="end">окончания</option><option value="start">начала</option></select></label><div class="chips">${[2,5,10,15,30].map(n=>`<button type="button" class="chip" data-minutes="${n}">${n} мин</button>`).join('')}</div><p class="muted">Время ввода использует часовой пояс устройства.</p>`:''}<label class="field">Источник<input name="source_name" list="recent-sources" maxlength="80" value="${esc(entry?.source_name||'')}"><datalist id="recent-sources">${state.recentSources.map(v=>`<option value="${esc(v)}"></option>`).join('')}</datalist></label><label class="field">Тип<select name="kind"><option value="">Не указано</option>${kinds.map(k=>`<option ${entry?.kind===k?'selected':''}>${esc(k)}</option>`).join('')}</select></label><label class="field">Почему именно я<select name="involvement_reason"><option value="">Не указано</option>${reasons.map(k=>`<option ${entry?.involvement_reason===k?'selected':''}>${esc(k)}</option>`).join('')}</select></label></div><label class="field">Заметка<textarea name="note" maxlength="500">${esc(entry?.note||'')}</textarea></label>${manual?'<label><input type="checkbox" name="estimated" checked> Время приблизительное</label>':''}<div class="row"><button class="primary">Сохранить</button>${entry?.id?'<button type="button" class="danger" id="delete-entry">Удалить</button>':''}</div><p class="warning" id="form-error"></p></form></div>`;}
-function daynote(){const n=state.snapshot?.day_note||{};return `<div class="modal" role="dialog" aria-modal="true"><form class="modal-card" id="daynote-form"><h2>Контекст дня</h2><div class="form-grid"><label class="field">План на свои задачи, минут<input name="planned_minutes" type="number" min="0" value="${esc(n.planned_minutes??'')}"></label><label class="field">Было доступно, минут<input name="available_minutes" type="number" min="0" value="${esc(n.available_minutes??'')}"></label><label class="field">Полнота журнала<select name="coverage"><option value="unknown" ${n.coverage==='unknown'?'selected':''}>Не оценивал</option><option value="partial" ${n.coverage==='partial'?'selected':''}>Записал часть</option><option value="full" ${n.coverage==='full'?'selected':''}>Внёс всё, что помню</option></select></label></div><label class="field">Что получилось<textarea name="outcomes_note">${esc(n.outcomes_note||'')}</textarea></label><div class="row"><button class="primary">Сохранить</button><button type="button" class="secondary" id="close">Отмена</button></div></form></div>`;}
-function render(){if(!state.settings)return;const draft=writer.draft;app.innerHTML=`<header class="topbar"><div><span class="brand">●</span> <strong>Трекер обращений</strong></div><div class="status">${draft?.error?'Есть несохранённые изменения':writer.running?'Сохраняю…':'Сохранено'}</div></header><nav class="nav" aria-label="Разделы">${[['today','Сегодня'],['history','Журнал'],['analysis','Разбор'],['settings','Настройки']].map(([id,label])=>`<button data-section="${id}" class="${state.section===id?'active':''}">${label}</button>`).join('')}</nav><main>${state.error?`<div class="card warning">${esc(state.error)} ${state.error.includes('вход')?'<a href="/">Восстановить вход</a>':''}</div>`:''}${draft?.error?`<div class="card warning">${esc(draft.error)}. Черновик сохранён на этом устройстве. <button id="retry" class="secondary">Повторить</button><button id="discard" class="danger">Удалить черновик</button></div>`:''}${Math.abs(clockSkew())>=60000?'<div class="card warning">Часы устройства заметно отличаются от серверных.</div>':''}${state.section==='today'?today():state.section==='history'?history():state.section==='analysis'?analysis():settings()}</main>${state.modal?.type==='daynote'?daynote():state.modal?form(state.modal.entry,state.modal.type==='manual'):''}`;bind();}
-function click(id,fn){document.getElementById(id)?.addEventListener('click',fn);}
-function bind(){document.querySelectorAll('[data-section]').forEach(b=>b.onclick=()=>{state.section=b.dataset.section;state.modal=null;state.load++;render();refresh();if(state.section==='history')loadHistory();if(state.section==='analysis')loadAnalysis();});
- const date=document.querySelector('#date');if(date)date.onchange=()=>{state.date=date.value;state.load++;refresh();if(state.section==='history')loadHistory();if(state.section==='analysis')loadAnalysis();};
- click('start',()=>{state.epoch++;writer.start({},now());});document.querySelectorAll('[data-pinned]').forEach(b=>b.onclick=()=>{const p=state.settings.pinned_actions[Number(b.dataset.pinned)];if(!p)return;state.epoch++;writer.start({source_name:p.source_name||null,kind:p.kind||null},now());}); click('finish',()=>{state.epoch++;if(!writer.draft&&active())writer.adopt(active());writer.finish(now());});
- click('switch',()=>{if(!writer.draft && active())writer.adopt(active());state.epoch++;writer.switch(now());});
- document.querySelectorAll('[data-kind]').forEach(b=>b.onclick=()=>{if(!writer.draft&&active())writer.adopt(active());state.epoch++;writer.update({kind:b.dataset.kind});});
- click('details',()=>{state.modal={type:'edit',entry:{...active(),...writer.draft?.fields}};render();});click('manual',()=>{state.modal={type:'manual'};render();});click('daynote',()=>{state.modal={type:'daynote'};render();});click('close',()=>{state.modal=null;render();});
- document.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>{const e=[...(state.snapshot?.entries||[]),...state.history].find(x=>x.id===b.dataset.edit);if(e){state.modal={type:'edit',entry:e};render();}});
- click('retry',()=>writer.retry());click('discard',()=>{if(confirm('Удалить несохранённый черновик?')){writer.discard();refresh();}});
- click('filter',()=>{state.source=document.querySelector('#filter-source').value;state.filterKind=document.querySelector('#filter-kind').value;state.query=document.querySelector('#filter-query').value;loadHistory();});click('more',()=>loadHistory(true));
- const rk=document.querySelector('#report-kind');if(rk)rk.onchange=()=>{state.reportKind=rk.value;loadAnalysis();};
- click('analyze',async()=>{if(!confirm('Запустить новый анализ? Поставщик модели может взимать плату.'))return;const id=crypto.randomUUID();sessionStorage.setItem('interruptions.report',JSON.stringify({id,date:state.date,kind:state.reportKind}));try{const r=await send('/api/reports','POST',{report_id:id,kind:state.reportKind,date:state.date,timezone:tz()});state.reportStatus=r.report?.status||'pending';await loadAnalysis();if(state.reportStatus==='pending')pollReport();}catch(e){state.reportStatus='unknown';error(e);pollReport();}});
- click('test-model',async()=>{if(!confirm('Проверка модели может быть платной. Продолжить?'))return;try{const r=await send('/api/llm/test','POST',{report_id:crypto.randomUUID()});alert(`Проверка: ${r.report?.status||r.status||'запущена'}`);}catch(e){error(e);}});
- const sf=document.querySelector('#settings-form');if(sf)sf.onsubmit=async ev=>{ev.preventDefault();const fields=Object.fromEntries(new FormData(sf));fields.pinned_actions=fields.pinned_actions_text.split('\n').map(line=>line.trim()).filter(Boolean).map(line=>{const [label,source_name,kind]=line.split('|').map(x=>x.trim());return {label,source_name:source_name||null,kind:kind||null};});delete fields.pinned_actions_text;if(fields.pinned_actions.some(p=>!p.label||p.label.length>80||(p.source_name||'').length>80||(p.kind&&!kinds.includes(p.kind)))){alert('Проверьте закреплённые действия: подпись до 80 символов, тип из списка приложения.');return;}try{state.epoch++;await send('/api/settings','PATCH',{expected_revision:state.settings.revision,...fields});const r=await request('/api/settings');state.settings=r.settings||r;state.date=dateToday();await refresh();}catch(e){error(e);}};
- bindForm();}
-function bindForm(){const f=document.querySelector('#entry-form'); if(f){let anchor='end'; const start=f.elements.started_at,end=f.elements.ended_at,mins=f.elements.minutes;function changeMinutes(n){if(!start||!end||!Number.isFinite(n))return;mins.value=n;if(anchor==='end')start.value=localInput(new Date(end.value).getTime()-n*60000);else end.value=localInput(new Date(start.value).getTime()+n*60000);}if(start){f.elements.anchor.onchange=e=>{anchor=e.target.value;};mins.oninput=()=>changeMinutes(Number(mins.value));start.onchange=()=>{anchor='start';f.elements.anchor.value=anchor;mins.value=Math.round((new Date(end.value)-new Date(start.value))/60000);};end.onchange=()=>{if(anchor==='end')changeMinutes(Number(mins.value));else mins.value=Math.round((new Date(end.value)-new Date(start.value))/60000);};document.querySelectorAll('[data-minutes]').forEach(b=>b.onclick=()=>changeMinutes(Number(b.dataset.minutes)));}
- f.onsubmit=async ev=>{ev.preventDefault();const entry=state.modal.entry;const values=Object.fromEntries(new FormData(f));const fields={source_name:values.source_name.trim()||null,kind:values.kind||null,involvement_reason:values.involvement_reason||null,note:values.note.trim()||null};if(start){if(Intl.DateTimeFormat().resolvedOptions().timeZone!==tz()){document.querySelector('#form-error').textContent='Для ввода времени установите на устройстве часовой пояс из настроек приложения.';return;}fields.started_at=new Date(values.started_at).getTime();fields.ended_at=new Date(values.ended_at).getTime();if(localInput(fields.started_at)!==values.started_at || localInput(fields.ended_at)!==values.ended_at){document.querySelector('#form-error').textContent='Такого местного времени не существует. Исправьте время.';return;}if([fields.started_at,fields.ended_at].some(t=>Array.from({length:360},(_,i)=>t+(i-180)*60000).some(other=>other!==t&&localInput(other)===localInput(t)))){document.querySelector('#form-error').textContent='Неоднозначное местное время при смене часового пояса: выберите другое время.';return;}if(!Number.isFinite(fields.started_at)||fields.ended_at<fields.started_at||fields.ended_at>now()){document.querySelector('#form-error').textContent='Проверьте начало и окончание: конец должен быть не раньше начала и не в будущем.';return;}}
- try{state.epoch++;if(!entry){await send('/api/entries','POST',{id:crypto.randomUUID(),mode:'manual',estimated:!!values.estimated,...fields});}else if(writer.draft?.id===entry.id&&!start){writer.update(fields);}else {await send(`/api/entries/${entry.id}`,'PATCH',{expected_revision:entry.revision,...fields});}state.modal=null;await refresh();if(state.section==='history')loadHistory();}catch(e){document.querySelector('#form-error').textContent=e.message;}};
- click('delete-entry',async()=>{const e=state.modal.entry;if(!confirm('Удалить это обращение?'))return;try{await send(`/api/entries/${e.id}`,'DELETE',{expected_revision:e.revision});if(writer.draft?.id===e.id)writer.discard();state.modal=null;await refresh();if(state.section==='history')loadHistory();}catch(e){document.querySelector('#form-error').textContent=e.message;}});}
- const dn=document.querySelector('#daynote-form');if(dn)dn.onsubmit=async ev=>{ev.preventDefault();const v=Object.fromEntries(new FormData(dn));for(const k of ['planned_minutes','available_minutes'])v[k]=v[k]===''?null:Number(v[k]);try{state.epoch++;await send(`/api/day-notes/${state.date}`,'PUT',{...v,expected_revision:state.snapshot?.day_note?.revision||0});state.modal=null;await refresh();}catch(e){error(e);}};
+
+function todayDate() {
+  return day(now(), timezone());
 }
-async function pollReport(){const saved=sessionStorage.getItem('interruptions.report');if(!saved||document.visibilityState!=='visible')return;try{const {id}=JSON.parse(saved);const data=await request('/api/reports/'+id);state.reportStatus=data.report?.status||'unknown';if(state.section==='analysis'&&!state.modal)render();if(state.reportStatus==='pending')setTimeout(pollReport,2000);else if(state.reportStatus==='completed'&&state.section==='analysis')loadAnalysis();}catch(e){state.reportStatus=e.status===404?'запрос не найден':'unknown';if(state.section==='analysis'&&!state.modal)render();}}
-async function init(){try{const data=await request('/api/settings');state.settings=data.settings||data;state.settings.has_key=data.has_key??state.settings.has_key;state.date=dateToday();render();await refresh();loadRecentSources();pollReport();}catch(e){app.innerHTML=`<div class="card warning">${esc(e.message)} ${e.status===401?'<a href="/">Восстановить вход</a>':''}</div>`;}}
-setInterval(()=>{document.querySelectorAll('[data-timer]').forEach(el=>el.textContent=duration(now()-Number(el.dataset.timer)));},1000);
-setInterval(()=>{if(document.visibilityState==='visible'&&!state.modal)refresh();},15000);
-document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'){refresh();pollReport();}});
-init();
+
+function receive(next) {
+  const previousTimeZone = model?.settings?.timezone;
+  const previousSync = model?.lastSync;
+  const changed = !model || next.viewKey !== model.viewKey;
+  model = next;
+  if (previousSync !== undefined && next.lastSync !== previousSync && next.serverNow
+      && next.serverNow !== lastServerTime && Date.now() - next.lastSync < 2000) {
+    const sampledAt = performance.now();
+    calibrate(next.serverNow, sampledAt, sampledAt);
+    lastServerTime = next.serverNow;
+  }
+  if (next.ready && (!ui.date || (previousTimeZone && previousTimeZone !== timezone()))) ui.date = todayDate();
+  if (!changed || ui.modal || ui.draftForm || ui.configBusy || document.activeElement?.matches('input,textarea,select')) {
+    updateSyncStatus();
+  } else {
+    render();
+  }
+}
+
+function selectedPeriod(kind = 'day') {
+  const range = bounds(ui.date, timezone(), kind);
+  const entries = model.entries.filter(entry =>
+    (entry.started_at < range.end && (entry.ended_at === null || entry.ended_at > range.start))
+    || (entry.started_at >= range.start && entry.started_at < range.end && entry.started_at === entry.ended_at),
+  );
+  const notes = model.notes.filter(note => note.date >= range.from && note.date < range.to);
+  return { range, entries, notes };
+}
+
+function activeEntry() {
+  return model.active;
+}
+
+function entryList(entries) {
+  if (!entries.length) return '<p class="muted">Нет записей</p>';
+  return entries.map(entry => `<button class="entry" type="button" data-edit="${escape(entry.id)}">
+    <span><strong>${escape(entry.source_name || 'Не указано')}</strong>
+    <small>${escape(entry.kind === 'unknown' ? 'Тип не указан' : entry.kind || 'Тип не указан')}${entry.note ? ' · ' + escape(entry.note) : ''}</small></span>
+    <span>${clock(entry.started_at, timezone())} · ${entry.ended_at === null ? 'идёт' : duration(entry.ended_at - entry.started_at)}</span>
+  </button>`).join('');
+}
+
+function timer() {
+  const entry = activeEntry();
+  if (!entry) {
+    const pins = model.settings.pinned_actions || [];
+    return `<div class="card hero"><h1>Что происходит сейчас?</h1>
+      <div class="row"><button class="primary big" id="start">Отвлекли</button>
+      <button class="secondary" id="manual">Записать прошедшее</button></div>
+      ${pins.length ? `<div class="chips entry-actions">${pins.map((pin, i) =>
+        `<button class="chip" data-pinned="${i}">${escape(pin.label)}</button>`).join('')}</div>` : ''}
+    </div>`;
+  }
+  const warn = now() - entry.started_at >= 7200000 || day(entry.started_at, timezone()) !== todayDate();
+  return `<div class="card hero"><p class="muted">Сейчас идёт</p>
+    <h1 class="timer" data-timer="${entry.started_at}">${duration(now() - entry.started_at)}</h1>
+    <p class="muted">Началось в ${clock(entry.started_at, timezone())} · ${escape(entry.source_name || 'Источник не указан')}</p>
+    ${warn ? '<p class="warning">Ещё идёт? Таймер не остановится автоматически.</p>' : ''}
+    <div class="row"><button class="primary" id="finish">Завершить</button>
+      <button class="secondary" id="switch">Завершить и начать новое</button></div>
+    <div class="chips entry-actions">${kinds.map(kind =>
+      `<button class="chip" data-kind="${escape(kind)}" aria-pressed="${entry.kind === kind}">${escape(kind)}</button>`).join('')}</div>
+    <button class="secondary" id="details">Добавить детали</button>
+  </div>`;
+}
+
+function dateInput() {
+  return `<input type="date" id="date" aria-label="Дата" value="${escape(ui.date)}">`;
+}
+
+function stat(label, value) {
+  return `<div class="stat"><strong>${escape(value)}</strong><span>${label}</span></div>`;
+}
+
+function today() {
+  const { range, entries, notes } = selectedPeriod();
+  const totals = metrics(entries, notes, range, timezone());
+  return `${timer()}<div class="row section-title"><h2>За выбранный день</h2>${dateInput()}</div>
+    <div class="card"><div class="stats">${stat('началось', totals.started_count)}
+    ${stat('сумма длительностей', duration(totals.total_duration_ms))}</div>${entryList(entries)}</div>
+    <button class="secondary" id="daynote">Контекст дня</button>`;
+}
+
+function options(values, selected, empty = 'Не указано') {
+  return `<option value="">${empty}</option>${values.map(value =>
+    `<option value="${escape(value)}" ${selected === value ? 'selected' : ''}>${escape(value)}</option>`).join('')}`;
+}
+
+function history() {
+  const { entries } = selectedPeriod();
+  const { source, kind, query } = ui.filters;
+  const matching = entries.filter(entry =>
+    (!source || entry.source_name === source) && (!kind || entry.kind === kind)
+    && (!query || entry.note?.toLowerCase().includes(query)),
+  );
+  return `<h1>Журнал</h1><form class="card" id="filters"><div class="form-grid">
+      <label class="field">Дата${dateInput()}</label>
+      <label class="field">Источник<input name="source" value="${escape(source)}"></label>
+      <label class="field">Тип<select name="kind">${options(kinds, kind, 'Все')}</select></label>
+      <label class="field">Поиск по заметке<input name="query" value="${escape(ui.filters.queryText)}"></label>
+    </div><div class="row"><button class="secondary">Применить</button>
+    <button type="button" class="secondary" id="manual">Записать прошедшее</button></div></form>
+    <div class="card">${entryList(matching.slice(0, ui.historyLimit))}
+    ${matching.length > ui.historyLimit ? '<button class="secondary" id="more">Загрузить ещё</button>' : ''}</div>`;
+}
+
+function reportContent(report) {
+  let result = report.result;
+  if (!result && report.result_json) {
+    try { result = JSON.parse(report.result_json); } catch { result = report.result_json; }
+  }
+  if (typeof result === 'string') return `<p>${escape(result)}</p>`;
+  if (!result) return '';
+  const observations = Array.isArray(result.observations) ? result.observations : [];
+  const details = [
+    ['Почему потребовалось участие', result.necessary_participation],
+    ['Гипотезы', result.hypotheses], ['Ограничения', result.limitations], ['Эксперимент', result.experiment],
+  ];
+  return `<p>${escape(result.summary)}</p>${observations.length ? `<ul>${observations.map(item =>
+    `<li>${escape(item?.text)}</li>`).join('')}</ul>` : ''}
+    ${details.filter(([, text]) => text).map(([title, text]) =>
+      `<p><strong>${title}</strong><br>${escape(text)}</p>`).join('')}`;
+}
+
+function reportError(code) {
+  return ({
+    PROVIDER_HTTP_401: 'Провайдер отклонил токен.',
+    PROVIDER_HTTP_403: 'Провайдер отказал в доступе.',
+    PROVIDER_HTTP_429: 'Провайдер ограничил запросы. Попробуйте позже.',
+    TIMEOUT: 'Провайдер не ответил вовремя.',
+    PROVIDER_UNREACHABLE: 'Не удалось связаться с провайдером.',
+    INVALID_MODEL_JSON: 'Модель вернула ответ в другом формате.',
+    INVALID_MODEL_RESULT: 'Ответ модели не прошёл проверку.',
+  })[code] || (code ? 'Проверьте подключение и ID модели в настройках.' : '');
+}
+
+function reportConnectionHint() {
+  if (!navigator.onLine || model?.error?.status === 0) return 'Для нового разбора нужен интернет.';
+  if (model?.error?.status === 401 || model?.error?.status === 403) return 'Войдите, чтобы запустить разбор.';
+  if (ui.configError && !ui.config) return ui.configError;
+  if (!ui.config) return 'Проверяем подключение к модели…';
+  if (ui.config.provider) return 'Личное подключение. Применяется тариф выбранного провайдера.';
+  if (ui.config.free_available) return 'Встроенный OpenRouter Free.';
+  return 'Подключение можно настроить в настройках.';
+}
+
+function reportAvailable() {
+  return navigator.onLine && !model?.error && !ui.reportBusy && ui.report?.status !== 'pending'
+    && Boolean(ui.config?.has_token || ui.config?.free_available);
+}
+
+function updateAnalysisControls() {
+  const hint = document.getElementById('report-provider-hint');
+  const button = document.getElementById('analyze');
+  if (hint) hint.textContent = reportConnectionHint();
+  if (button) button.disabled = !reportAvailable();
+}
+
+function analysis() {
+  const { range, entries, notes } = selectedPeriod(ui.kind);
+  const totals = metrics(entries, notes, range, timezone());
+  const reports = model.reports.filter(report =>
+    report.status === 'completed' && report.kind === ui.kind && report.date_from === range.from,
+  ).sort((a, b) => b.created_at - a.created_at);
+  const reportStatus = ui.report && `<p class="muted notice">${escape(reportLabels[ui.report.status] || ui.report.status || '')}
+    ${escape(reportError(ui.report.error_code))}
+    ${ui.report.status === 'unknown' ? 'Запрос мог быть обработан провайдером.' : ''}</p>`;
+  return `<h1>Разбор</h1><div class="card">
+    <div class="row"><select id="report-kind" aria-label="Период">
+      <option value="day" ${ui.kind === 'day' ? 'selected' : ''}>День</option>
+      <option value="week" ${ui.kind === 'week' ? 'selected' : ''}>Неделя</option>
+    </select>${dateInput()}</div>
+    <div class="stats entry-actions">${Object.entries(metricLabels).filter(([key]) => typeof totals[key] === 'number').map(([key, label]) =>
+      stat(label, key.endsWith('_ms') ? duration(totals[key]) : totals[key])).join('')}</div>
+    <p class="muted entry-actions" id="report-provider-hint">${escape(reportConnectionHint())}</p>
+    <button class="primary" id="analyze" ${reportAvailable() ? '' : 'disabled'}>Разобрать</button>
+    ${reportStatus || ''}</div>
+    <div class="card"><h2>Отчёты</h2>${reports.length ? reports.map(report =>
+      `<article class="report"><strong>${escape(report.model)}</strong>${reportContent(report)}</article>`).join('') :
+      '<p class="muted">Отчётов пока нет</p>'}</div>`;
+}
+
+function providerSettings() {
+  const config = ui.config;
+  if (!config) {
+    return `<div class="card"><h2>Подключение к модели</h2><p class="muted">${escape(ui.configError || 'Загружаем настройки подключения…')}</p>
+      <button class="secondary" id="reload-provider">Обновить</button></div>`;
+  }
+  return `<form class="card" id="provider-form" autocomplete="off">
+    <h2>Подключение к модели</h2>
+    <label class="field">Провайдер<select name="provider">${providers.map(([value, name]) =>
+      `<option value="${value}" ${(config.provider || '') === value ? 'selected' : ''}>${name}</option>`).join('')}</select></label>
+    <div id="personal-provider" ${config.provider ? '' : 'hidden'}>
+      <label class="field" id="base-url-field" ${config.provider === 'custom' ? '' : 'hidden'}>Base URL
+        <input type="url" name="base_url" placeholder="https://example.com/v1" value="${escape(config.provider === 'custom' ? config.base_url : '')}" ${config.provider === 'custom' ? 'required' : ''}></label>
+      <label class="field">Модель<input name="model" value="${escape(config.model)}" ${config.provider ? 'required' : ''}></label>
+      <label class="field">Токен<input type="password" name="token" autocomplete="new-password" spellcheck="false"></label>
+      <p class="muted" id="token-status">${config.has_token ? 'Токен сохранён. Оставьте поле пустым, чтобы сохранить его для этого провайдера.' : 'Введите токен своего провайдера.'}</p>
+    </div>
+    <p class="muted" id="free-provider" ${config.provider ? 'hidden' : ''}>${config.free_available ?
+      'Разбор использует бесплатные модели OpenRouter.' : 'Встроенный ключ ещё не настроен.'}</p>
+    <div class="row"><button class="primary" ${ui.configBusy ? 'disabled' : ''}>Сохранить подключение</button>
+      <button class="secondary" type="button" id="test-model" ${ui.configBusy || (!config.has_token && !config.free_available) ? 'disabled' : ''}>Проверить модель</button></div>
+    <p id="provider-message" class="notice" aria-live="polite">${escape(ui.configError)}</p>
+  </form>`;
+}
+
+function settings() {
+  const values = model.settings;
+  const pins = (values.pinned_actions || []).map(pin => [pin.label, pin.source_name || '', pin.kind || ''].join(' | ')).join('\n');
+  return `<h1>Настройки</h1>
+    <form class="card" id="settings-form">
+      <label class="field">Часовой пояс<input name="timezone" value="${escape(values.timezone)}" required></label>
+      <label class="field">Закреплённые действия <small>По одному на строке: подпись | источник | тип</small>
+        <textarea name="pinned_actions_text">${escape(pins)}</textarea></label>
+      <label class="field">Рабочая роль<textarea name="analysis_context" maxlength="2000">${escape(values.analysis_context)}</textarea></label>
+      <button class="primary">Сохранить настройки</button>
+    </form>${providerSettings()}
+    <div class="card"><h2>Выгрузка</h2><div class="row">
+      <a class="secondary" href="/api/export?format=json">Скачать JSON</a>
+      <a class="secondary" href="/api/export?format=csv">Скачать CSV</a></div></div>`;
+}
+
+function inputTime(timestamp, zone = timezone()) {
+  return Temporal.Instant.fromEpochMilliseconds(timestamp).toZonedDateTimeISO(zone)
+    .toPlainDateTime().toString({ smallestUnit: 'minute' });
+}
+
+function parseTime(value, zone = timezone()) {
+  return Number(Temporal.PlainDateTime.from(value).toZonedDateTime(zone, {
+    disambiguation: 'reject',
+  }).epochMilliseconds);
+}
+
+function entryForm() {
+  const { entry, type, zone } = ui.modal;
+  const manual = type === 'manual';
+  const editTimes = manual || entry?.ended_at != null;
+  let defaultEnd = now();
+  if (manual && ui.date !== todayDate()) {
+    defaultEnd = Number(Temporal.PlainDate.from(ui.date).toZonedDateTime({ timeZone: zone, plainTime: '12:00' }).epochMilliseconds);
+  }
+  const start = entry?.started_at ?? defaultEnd - 300000;
+  const end = entry?.ended_at ?? defaultEnd;
+  const recentSources = [...new Set(model.entries.map(item => item.source_name).filter(Boolean))].slice(0, 8);
+  return `<div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <form class="modal-card" id="entry-form"><div class="row">
+      <h2 id="modal-title">${manual ? 'Прошедшее обращение' : 'Детали обращения'}</h2>
+      <button type="button" class="secondary" id="close">Закрыть</button>
+    </div><div class="form-grid">
+      ${editTimes ? `<label class="field">Начало<input type="datetime-local" name="started_at" value="${inputTime(start, zone)}" required></label>
+      <label class="field">Окончание<input type="datetime-local" name="ended_at" value="${inputTime(end, zone)}" required></label>
+      <label class="field">Длительность, минут<input type="number" min="0" max="10080" name="minutes" value="${Math.round((end - start) / 60000)}"></label>
+      <label class="field">Считать от<select name="anchor"><option value="end">окончания</option><option value="start">начала</option></select></label>
+      <div class="chips">${[2, 5, 10, 15, 30].map(n =>
+        `<button type="button" class="chip" data-minutes="${n}">${n} мин</button>`).join('')}</div>
+      <p class="muted">Часовой пояс ${escape(zone)}</p>` : ''}
+      <label class="field">Источник<input name="source_name" list="recent-sources" maxlength="80" value="${escape(entry?.source_name)}"></label>
+      <datalist id="recent-sources">${recentSources.map(value => `<option value="${escape(value)}"></option>`).join('')}</datalist>
+      <label class="field">Тип<select name="kind">${options(kinds, entry?.kind)}</select></label>
+      <label class="field">Почему именно я<select name="involvement_reason">${options(reasons, entry?.involvement_reason)}</select></label>
+    </div><label class="field">Заметка<textarea name="note" maxlength="500">${escape(entry?.note)}</textarea></label>
+    ${manual ? '<label><input type="checkbox" name="estimated" checked> Время приблизительное</label>' : ''}
+    <div class="row"><button class="primary">Сохранить</button>
+      ${entry ? '<button type="button" class="danger" id="delete-entry">Удалить</button>' : ''}</div>
+    <p class="warning notice" id="form-error" role="alert"></p></form></div>`;
+}
+
+function dayNoteForm() {
+  const note = ui.modal.note || {};
+  const range = bounds(ui.modal.date, ui.modal.zone);
+  const maxMinutes = (range.end - range.start) / 60000;
+  return `<div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <form class="modal-card" id="daynote-form"><h2 id="modal-title">Контекст дня</h2>
+    <div class="form-grid">
+      <label class="field">План на свои задачи, минут<input name="planned_minutes" type="number" min="0" max="${maxMinutes}" value="${escape(note.planned_minutes)}"></label>
+      <label class="field">Было доступно, минут<input name="available_minutes" type="number" min="0" max="${maxMinutes}" value="${escape(note.available_minutes)}"></label>
+      <label class="field">Полнота журнала<select name="coverage">
+        <option value="unknown">Не оценивал</option>
+        <option value="partial" ${note.coverage === 'partial' ? 'selected' : ''}>Записал часть</option>
+        <option value="full" ${note.coverage === 'full' ? 'selected' : ''}>Внёс всё, что помню</option>
+      </select></label></div>
+    <label class="field">Что получилось<textarea name="outcomes_note" maxlength="2000">${escape(note.outcomes_note)}</textarea></label>
+    <div class="row"><button class="primary">Сохранить</button>
+      <button type="button" class="secondary" id="close">Отмена</button></div>
+    <p class="warning notice" id="form-error" role="alert"></p></form></div>`;
+}
+
+function describeVersion(kind, value) {
+  if (!value) return '<p class="muted">Запись отсутствует или удалена.</p>';
+  if (kind === 'entry') {
+    return `<p><strong>${escape(value.source_name || 'Источник не указан')}</strong><br>
+      ${Number.isFinite(value.started_at) ? escape(inputTime(value.started_at).replace('T', ' ')) : ''}
+      ${value.ended_at === null ? ' · таймер идёт' : Number.isFinite(value.ended_at) ?
+        ' — ' + escape(inputTime(value.ended_at).replace('T', ' ')) : ''}</p>
+      <p>${escape([value.kind === 'unknown' ? '' : value.kind, value.involvement_reason, value.note].filter(Boolean).join(' · '))}</p>`;
+  }
+  if (kind === 'day_note') {
+    return `<p>План ${escape(value.planned_minutes ?? '—')} мин · Доступно ${escape(value.available_minutes ?? '—')} мин</p>
+      <p>${escape(value.outcomes_note)}</p>`;
+  }
+  return `<p>${escape(value.timezone)}</p><p>${escape(value.analysis_context)}</p>
+    <p>${escape((value.pinned_actions || []).map(pin => pin.label).join(' · '))}</p>`;
+}
+
+function conflictNotice(conflict) {
+  const { operation, changes, error } = conflict;
+  const { type, payload } = operation;
+  const kind = type.split('.')[0];
+  const key = payload.id || payload.expected_id || payload.date || '1';
+  const local = kind === 'entry' ? model.entries.find(entry => entry.id === key) :
+    kind === 'day_note' ? model.notes.find(note => note.date === key) : model.settings;
+  const remote = error.code === 'ACTIVE_ENTRY_EXISTS'
+    ? changes.find(change => change.kind === 'entry' && change.id !== key && change.value?.ended_at === null)
+    : changes.find(change => change.kind === kind && change.id === key);
+  return `<div class="card warning"><h2>Нужно решить конфликт</h2><p>${escape(error.message)}</p>
+    <div class="grid conflict-versions"><div><h3>На этом устройстве</h3>
+      ${type === 'entry.delete' ? '<p>Удаление записи</p>' : describeVersion(kind, local || payload)}</div>
+      <div><h3>В облаке</h3>${describeVersion(kind, remote?.value)}</div></div>
+    <div class="row">
+      <button type="button" class="secondary" data-resolution="remote">Оставить облачную версию</button>
+      ${conflict.canUseLocal ? '<button type="button" class="primary" data-resolution="local">Сохранить мою версию</button>' : ''}
+      ${conflict.canSaveClosed ? '<button type="button" class="primary" data-resolution="closed">Сохранить мой таймер как завершённый</button>' : ''}
+    </div></div>`;
+}
+
+function syncStatus() {
+  if (!model?.ready) return 'Первая синхронизация';
+  if (model.conflict) return 'Синхронизация ждёт решения';
+  if (model.error?.status === 401 || model.error?.status === 403) return 'Нужно войти';
+  if (model.error || !navigator.onLine) return model.pending ? `Без сети · в очереди ${model.pending}` : 'Без сети';
+  if (model.pending) return `На устройстве · в очереди ${model.pending}`;
+  return model.syncing ? 'Синхронизация…' : 'Синхронизировано';
+}
+
+function syncNotice() {
+  const error = model?.error;
+  const access = error && [401, 403].includes(error.status);
+  const failure = error && error.status !== 0 && !access;
+  return `${access ? '<div class="card warning">Восстановите вход для синхронизации. Записи на устройстве сохранены. <a href="/">Войти</a></div>' : ''}
+    ${failure ? `<div class="card warning">${escape(error.message)} <button class="secondary" id="sync-retry">Повторить</button></div>` : ''}
+    ${model?.conflict ? conflictNotice(model.conflict) : ''}
+    ${model?.ready && Math.abs(clockSkew()) >= 60000 ? '<div class="card warning">Часы устройства заметно отличаются от серверных.</div>' : ''}`;
+}
+
+function legacyNotice() {
+  const drafts = store.legacyDrafts();
+  if (!drafts.length) return '';
+  return `<div class="card"><h2>Черновики из прежней версии</h2>
+    ${drafts.map(({ key, draft }) => `<div class="row"><span>${escape(draft.fields?.source_name || draft.entry?.source_name || 'Обращение')}
+      ${Number.isFinite(draft.started_at ?? draft.entry?.started_at) ?
+        ' · ' + escape(inputTime(draft.started_at ?? draft.entry.started_at).replace('T', ' ')) : ''}</span>
+      <button class="secondary" data-legacy="${escape(key)}">Восстановить</button></div>`).join('')}</div>`;
+}
+
+function on(id, event, listener) {
+  document.getElementById(id)?.addEventListener(event, listener);
+}
+
+function onClick(id, listener) {
+  on(id, 'click', listener);
+}
+
+function showError(error, elementId) {
+  const specific = elementId && document.getElementById(elementId);
+  if (specific) {
+    specific.textContent = error.message;
+  } else {
+    ui.message = error.message;
+    render();
+  }
+}
+
+function openModal(type, fields = {}) {
+  ui.modal = { type, zone: timezone(), ...fields };
+  render();
+  document.querySelector('.modal input:not([type=checkbox]), .modal textarea')?.focus();
+}
+
+function updateSyncStatus() {
+  updateAnalysisControls();
+  const status = document.getElementById('sync-status');
+  const notice = document.getElementById('sync-notice');
+  if (status) {
+    const text = syncStatus();
+    if (status.textContent !== text) status.textContent = text;
+    status.dataset.waiting = String(Boolean(model?.pending || model?.error || model?.conflict));
+  }
+  if (notice) {
+    const html = syncNotice();
+    if (notice.dataset.current === html) return;
+    notice.dataset.current = html;
+    notice.innerHTML = html;
+    onClick('sync-retry', () => { void store.sync(); });
+    notice.querySelectorAll('[data-resolution]').forEach(button => {
+      button.onclick = async () => {
+        button.disabled = true;
+        try {
+          await store.resolve(button.dataset.resolution, { ended_at: now() });
+          render();
+        } catch (error) {
+          showError(error);
+        }
+      };
+    });
+  }
+}
+
+function render() {
+  const status = `<div class="status" id="sync-status" role="status">${escape(syncStatus())}</div>`;
+  const header = `<header class="topbar"><strong>Трекер обращений</strong>${status}</header>`;
+  const message = ui.message && `<div class="card warning" role="alert">${escape(ui.message)}</div>`;
+  if (!model?.ready) {
+    app.innerHTML = `${header}<main><div id="sync-notice"></div>${message || ''}
+      <div class="card"><h1>Загружаем журнал</h1>
+      <p>Для первой синхронизации нужен интернет и вход в приложение.</p>
+      <button class="secondary" id="first-sync">Повторить</button></div></main>`;
+    onClick('first-sync', () => { void store.sync(); });
+    updateSyncStatus();
+    return;
+  }
+  const nav = `<nav class="nav" aria-label="Разделы">${sections.map(([id, label]) =>
+    `<button data-section="${id}" ${ui.section === id ? 'aria-current="page"' : ''}>${label}</button>`).join('')}</nav>`;
+  const content = ({ today, history, analysis, settings })[ui.section]();
+  const modal = ui.modal ? (ui.modal.type === 'daynote' ? dayNoteForm() : entryForm()) : '';
+  app.innerHTML = `${header}${nav}<main><div id="sync-notice"></div>${message || ''}
+    ${legacyNotice()}${content}</main>${modal}`;
+  updateSyncStatus();
+  bind();
+}
+
+async function enqueue(type, payload, errorElement) {
+  try {
+    ui.message = '';
+    await store.enqueue(type, payload);
+    ui.modal = null;
+    ui.draftForm = false;
+    render();
+  } catch (error) {
+    showError(error, errorElement);
+  }
+}
+
+function submitEntry(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const { entry, zone } = ui.modal;
+  const values = new FormData(form);
+  const payload = {
+    source_name: values.get('source_name').trim() || null,
+    kind: values.get('kind') || null,
+    involvement_reason: values.get('involvement_reason') || null,
+    note: values.get('note').trim() || null,
+  };
+  if (form.elements.started_at) {
+    const { started_at, ended_at } = form.elements;
+    try {
+      const start = entry && started_at.value === started_at.defaultValue ? entry.started_at : parseTime(started_at.value, zone);
+      const end = entry && ended_at.value === ended_at.defaultValue ? entry.ended_at : parseTime(ended_at.value, zone);
+      if (end < start || end > now()) throw new Error('Некорректный интервал.');
+      if (!entry || start !== entry.started_at) payload.started_at = start;
+      if (!entry || end !== entry.ended_at) payload.ended_at = end;
+    } catch {
+      document.getElementById('form-error').textContent = 'Проверьте начало и окончание. Время должно существовать в выбранном часовом поясе, а окончание не может быть раньше начала или в будущем.';
+      return;
+    }
+  }
+  if (entry) {
+    void enqueue('entry.update', { id: entry.id, expected_revision: entry.revision, ...payload }, 'form-error');
+  } else {
+    void enqueue('entry.create', { id: crypto.randomUUID(), mode: 'manual', estimated: values.has('estimated'), ...payload }, 'form-error');
+  }
+}
+
+function bindEntryForm() {
+  const form = document.getElementById('entry-form');
+  if (!form) return;
+  form.onsubmit = submitEntry;
+  onClick('delete-entry', () => {
+    const entry = ui.modal.entry;
+    if (confirm('Удалить это обращение?')) {
+      void enqueue('entry.delete', { id: entry.id, expected_revision: entry.revision }, 'form-error');
+    }
+  });
+  const { started_at: start, ended_at: end, minutes, anchor } = form.elements;
+  if (!start) return;
+  const { zone } = ui.modal;
+  function shift(number) {
+    if (!Number.isFinite(number)) return;
+    try {
+      if (anchor.value === 'end') start.value = inputTime(parseTime(end.value, zone) - number * 60000, zone);
+      else end.value = inputTime(parseTime(start.value, zone) + number * 60000, zone);
+      minutes.value = number;
+    } catch { /* Invalid local time is reported when the form is submitted. */ }
+  }
+  function updateMinutes() {
+    try { minutes.value = Math.round((parseTime(end.value, zone) - parseTime(start.value, zone)) / 60000); }
+    catch { minutes.value = ''; }
+  }
+  start.onchange = () => { anchor.value = 'start'; updateMinutes(); };
+  end.onchange = () => { anchor.value = 'end'; updateMinutes(); };
+  minutes.oninput = () => { if (minutes.value !== '') shift(Number(minutes.value)); };
+  form.querySelectorAll('[data-minutes]').forEach(button => {
+    button.onclick = () => shift(Number(button.dataset.minutes));
+  });
+}
+
+function bindGeneralSettings() {
+  const form = document.getElementById('settings-form');
+  if (!form) return;
+  const expectedRevision = model.settings.revision;
+  form.oninput = () => { ui.draftForm = true; };
+  form.onsubmit = event => {
+    event.preventDefault();
+    const fields = Object.fromEntries(new FormData(form));
+    const timezone = fields.timezone.trim();
+    try { day(now(), timezone); bounds('2026-01-01', timezone); }
+    catch { alert('Укажите корректный часовой пояс, например Europe/Moscow.'); return; }
+    const pinned = fields.pinned_actions_text.split('\n').map(value => value.trim()).filter(Boolean).map(value => {
+      const [label, source_name, kind] = value.split('|').map(part => part.trim());
+      return { label, source_name: source_name || null, kind: kind || null };
+    });
+    if (pinned.length > 50 || pinned.some(pin =>
+      !pin.label || pin.label.length > 80 || pin.source_name?.length > 80 || (pin.kind && !kinds.includes(pin.kind)),
+    )) {
+      alert('Проверьте быстрые действия. Допустимо до 50 действий, подпись и источник до 80 символов, тип из списка приложения.');
+      return;
+    }
+    void enqueue('settings.patch', {
+      expected_revision: expectedRevision, timezone, pinned_actions: pinned, analysis_context: fields.analysis_context,
+    });
+  };
+}
+
+function updateProviderFields(form) {
+  const provider = form.elements.provider.value;
+  const custom = provider === 'custom';
+  const changed = provider && (provider !== ui.config.provider ||
+    (custom && form.elements.base_url.value.replace(/\/$/, '') !== ui.config.base_url));
+  document.getElementById('personal-provider').hidden = !provider;
+  document.getElementById('free-provider').hidden = !!provider;
+  document.getElementById('base-url-field').hidden = !custom;
+  form.elements.base_url.required = custom;
+  form.elements.base_url.disabled = !custom;
+  form.elements.model.required = !!provider;
+  form.elements.token.required = Boolean(provider && (changed || !ui.config.has_token));
+  document.getElementById('test-model').disabled = ui.draftForm || (!ui.config.has_token && !ui.config.free_available);
+}
+
+async function loadProvider() {
+  if (configRequest || ui.configBusy) return configRequest;
+  configRequest = (async () => {
+    try {
+      ui.config = await request('/api/llm/config');
+      ui.configError = '';
+    } catch (error) {
+      ui.configError = error.message;
+    } finally {
+      configRequest = null;
+      if (ui.section === 'settings' && !ui.draftForm && !ui.modal) render();
+      else if (ui.section === 'analysis') updateAnalysisControls();
+    }
+  })();
+  return configRequest;
+}
+
+async function saveProvider(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const fields = new FormData(form);
+  const provider = fields.get('provider');
+  const body = provider ? {
+    provider, model: fields.get('model').trim(),
+    ...(provider === 'custom' ? { base_url: fields.get('base_url').trim() } : {}),
+    ...(fields.get('token').trim() ? { token: fields.get('token').trim() } : {}),
+  } : {};
+  ui.configBusy = true;
+  form.querySelector('button[type=submit], button.primary').disabled = true;
+  try {
+    ui.config = await send('/api/llm/config', provider ? 'PUT' : 'DELETE', body);
+    form.elements.token.value = '';
+    ui.configError = 'Подключение сохранено.';
+    ui.draftForm = false;
+  } catch (error) {
+    ui.configError = error.message;
+    const message = form.querySelector('#provider-message');
+    message.textContent = ui.configError;
+  } finally {
+    ui.configBusy = false;
+    if (!ui.draftForm) render();
+    else form.querySelector('button[type=submit], button.primary').disabled = false;
+  }
+}
+
+function bindProvider() {
+  const form = document.getElementById('provider-form');
+  if (!form) return;
+  updateProviderFields(form);
+  form.oninput = event => {
+    ui.draftForm = true;
+    if (event.target.name === 'provider') form.elements.token.value = '';
+    updateProviderFields(form);
+  };
+  form.onsubmit = saveProvider;
+  onClick('test-model', async () => {
+    if (ui.config.provider && !confirm('Проверка отправит тестовый запрос по тарифу провайдера. Продолжить?')) return;
+    const button = document.getElementById('test-model');
+    button.disabled = true;
+    try {
+      const data = await send('/api/llm/test', 'POST', { report_id: crypto.randomUUID() });
+      ui.configError = data.report?.status === 'completed' ? 'Подключение работает.' :
+        reportError(data.report?.error_code) || 'Проверка пока не завершилась.';
+    } catch (error) {
+      ui.configError = error.message;
+    }
+    if (ui.section === 'settings' && !ui.draftForm) render();
+    else if (button.isConnected) button.disabled = false;
+  });
+}
+
+function bind() {
+  document.querySelectorAll('[data-section]').forEach(button => {
+    button.onclick = () => {
+      ui.section = button.dataset.section;
+      ui.modal = null;
+      ui.draftForm = false;
+      ui.message = '';
+      render();
+      if (['settings', 'analysis'].includes(ui.section)) void loadProvider();
+      if (ui.section === 'analysis') void pollReport();
+    };
+  });
+  on('date', 'change', event => {
+    if (event.target.value && ui.section !== 'history') {
+      ui.date = event.target.value;
+      render();
+    }
+  });
+  on('filters', 'input', () => { ui.draftForm = true; });
+  on('filters', 'submit', event => {
+    event.preventDefault();
+    const fields = Object.fromEntries(new FormData(event.currentTarget));
+    ui.date = document.getElementById('date').value || ui.date;
+    ui.filters = { source: fields.source.trim(), kind: fields.kind, queryText: fields.query, query: fields.query.trim().toLowerCase() };
+    ui.historyLimit = 100;
+    ui.draftForm = false;
+    render();
+  });
+  onClick('more', () => { ui.historyLimit += 100; render(); });
+  onClick('manual', () => openModal('manual'));
+  onClick('details', () => { const entry = activeEntry(); if (entry) openModal('edit', { entry }); });
+  onClick('daynote', () => openModal('daynote', { date: ui.date, note: model.notes.find(note => note.date === ui.date) }));
+  onClick('close', () => { ui.modal = null; render(); });
+  const start = (preset = {}) => {
+    if (!activeEntry()) void enqueue('entry.create', { id: crypto.randomUUID(), mode: 'timer', started_at: now(), ...preset });
+  };
+  onClick('start', () => start());
+  document.querySelectorAll('[data-pinned]').forEach(button => {
+    button.onclick = () => {
+      const pin = model.settings.pinned_actions[Number(button.dataset.pinned)];
+      if (pin) start({ source_name: pin.source_name, kind: pin.kind });
+    };
+  });
+  onClick('finish', () => {
+    const entry = activeEntry();
+    if (entry) void enqueue('entry.finish', { id: entry.id, expected_revision: entry.revision, clicked_ended_at: now() });
+  });
+  onClick('switch', () => {
+    const entry = activeEntry();
+    if (entry) void enqueue('entry.switch', {
+      expected_id: entry.id, expected_revision: entry.revision, new_entry_id: crypto.randomUUID(), switch_at: now(),
+    });
+  });
+  document.querySelectorAll('[data-kind]').forEach(button => {
+    button.onclick = () => {
+      const entry = activeEntry();
+      if (entry) void enqueue('entry.update', { id: entry.id, expected_revision: entry.revision, kind: button.dataset.kind });
+    };
+  });
+  document.querySelectorAll('[data-edit]').forEach(button => {
+    button.onclick = () => {
+      const entry = model.entries.find(item => item.id === button.dataset.edit);
+      if (entry) openModal('edit', { entry });
+    };
+  });
+  document.querySelectorAll('[data-legacy]').forEach(button => {
+    button.onclick = async () => {
+      if (!confirm('Восстановить черновик и синхронизировать его с журналом?')) return;
+      try { await store.restoreDraft(button.dataset.legacy); render(); }
+      catch (error) { showError(error); }
+    };
+  });
+  on('daynote-form', 'submit', event => {
+    event.preventDefault();
+    const values = Object.fromEntries(new FormData(event.currentTarget));
+    for (const key of ['planned_minutes', 'available_minutes']) values[key] = values[key] === '' ? null : Number(values[key]);
+    void enqueue('day_note.put', { date: ui.modal.date, expected_revision: ui.modal.note?.revision || 0, ...values }, 'form-error');
+  });
+  on('report-kind', 'change', event => { ui.kind = event.target.value; render(); });
+  onClick('analyze', () => { void runReport(); });
+  onClick('reload-provider', () => { void loadProvider(); });
+  bindEntryForm();
+  bindGeneralSettings();
+  bindProvider();
+}
+
+function savedReport() {
+  try { return JSON.parse(sessionStorage.getItem(reportKey)); }
+  catch { return null; }
+}
+
+function rememberReport(id) {
+  try { sessionStorage.setItem(reportKey, JSON.stringify({ id })); }
+  catch { /* History remains available in IndexedDB after synchronization. */ }
+}
+
+function acceptReport(report) {
+  ui.report = report;
+  clearTimeout(reportPoll);
+  if (report.status === 'pending' || report.status === 'unknown' && !report.error_code) {
+    reportPoll = setTimeout(pollReport, 2000);
+  }
+  if (report.status === 'completed') void store.sync();
+  if (ui.section === 'analysis' && !ui.modal) render();
+}
+
+async function pollReport() {
+  const saved = savedReport();
+  if (!saved?.id || pollingReport || !navigator.onLine || document.visibilityState !== 'visible') return;
+  pollingReport = true;
+  try {
+    const response = await request(`/api/reports/${encodeURIComponent(saved.id)}`);
+    if (response.report) acceptReport(response.report);
+  } catch (error) {
+    if (error.status === 404 || error.status === 410) {
+      try { sessionStorage.removeItem(reportKey); } catch { /* Storage may be unavailable. */ }
+    }
+  } finally {
+    pollingReport = false;
+  }
+}
+
+async function runReport() {
+  if (!reportAvailable()) return;
+  if (!confirm('Запустить разбор? С личным подключением применяется тариф поставщика.')) return;
+  const { kind, date } = ui;
+  ui.reportBusy = true;
+  ui.message = '';
+  render();
+  let id;
+  try {
+    if (!await store.sync()) throw new Error('Сначала завершите синхронизацию журнала.');
+    id = crypto.randomUUID();
+    rememberReport(id);
+    const response = await send('/api/reports', 'POST', {
+      report_id: id, kind, date, timezone: timezone(),
+    });
+    if (response.report) acceptReport(response.report);
+  } catch (error) {
+    if (id && (error.status === 0 || error.status >= 500)) acceptReport({ status: 'unknown' });
+    showError(error);
+  } finally {
+    ui.reportBusy = false;
+    if (ui.section === 'analysis' && !ui.modal) render();
+  }
+}
+
+function refreshVisible() {
+  if (document.visibilityState !== 'visible') return;
+  void store.sync();
+  if (['settings', 'analysis'].includes(ui.section) && !ui.draftForm) void loadProvider();
+  void pollReport();
+}
+
+async function init() {
+  render();
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js').catch(() => {
+      ui.message = 'Не удалось подготовить приложение к открытию без сети.';
+      if (!ui.modal && !ui.draftForm) render();
+    });
+  }
+  try {
+    await store.open();
+    refreshVisible();
+  } catch (error) {
+    showError(new Error(`Не удалось открыть локальный журнал. ${error.message}`));
+  }
+}
+
+window.addEventListener('online', refreshVisible);
+window.addEventListener('offline', () => {
+  updateSyncStatus();
+  if (!ui.modal && !ui.draftForm) render();
+});
+document.addEventListener('visibilitychange', refreshVisible);
+setInterval(() => {
+  document.querySelectorAll('[data-timer]').forEach(element => {
+    element.textContent = duration(now() - Number(element.dataset.timer));
+  });
+}, 1000);
+setInterval(() => {
+  if (document.visibilityState === 'visible' && navigator.onLine) void store.sync();
+}, 15000);
+
+void init();

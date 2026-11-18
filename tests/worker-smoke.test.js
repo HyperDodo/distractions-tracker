@@ -8,7 +8,9 @@ import {handleEntries} from '../backend/entries.js';
 // SQLite-backed D1 adapter tests the HTTP contract locally; it is not a real D1 test.
 function database() {
   const db = new DatabaseSync(':memory:');
-  for (const name of ['0001_init.sql','0002_reports.sql']) db.exec(readFileSync(new URL(`../migrations/${name}`, import.meta.url), 'utf8'));
+  for (const name of ['0001_init.sql','0002_reports.sql','0003_sync.sql','0004_llm.sql']) {
+    db.exec(readFileSync(new URL(`../migrations/${name}`, import.meta.url), 'utf8'));
+  }
   let afterBatch;
   return {
     setAfterBatch(fn) {afterBatch = fn;},
@@ -68,6 +70,11 @@ test('API: start, optimistic conflict, finish, snapshot and timezone change', as
     assert.equal(snapshot.status,200);assert.equal(snapshot.body.entries[0].kind,'Проблема');assert.equal(snapshot.body.active_entry,null);
     const wrong=await call(`/api/snapshot?date=${date}&timezone=UTC`);
     assert.equal(wrong.status,409);assert.equal(wrong.body.error.code,'TIMEZONE_CHANGED');assert.equal(wrong.body.settings.timezone,'Europe/Moscow');
+    const replicated=await call('/api/sync?after=0');
+    assert.equal(replicated.status,200);
+    assert.equal(replicated.body.changes.find(change=>change.id===id).value.ended_at,timestamp+5000);
+    const rejected=await worker.fetch(new Request('https://tracker.test/api/sync?after=0'),env,{});
+    assert.equal(rejected.status,401);
   } finally {globalThis.fetch=oldFetch;}
 });
 

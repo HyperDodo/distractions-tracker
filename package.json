@@ -4,16 +4,22 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev --local",
+    "build": "node scripts/build-pwa.js",
+    "dev": "npm run build && wrangler dev --local",
+    "deploy": "npm run build && wrangler deploy",
     "migrate:local": "wrangler d1 migrations apply interruption-tracker --local",
-    "test": "node --test tests/*.test.js && python3 -m unittest discover -s tests -p 'test_*.py'",
-    "check": "wrangler deploy --dry-run --outdir /tmp/interruption-tracker-build"
+    "test": "npm run build && node --test tests/*.test.js && python3 -m unittest discover -s tests -p 'test_*.py'",
+    "check": "npm run deploy -- --dry-run --outdir /tmp/interruption-tracker-build"
   },
   "dependencies": {
     "@js-temporal/polyfill": "^0.5.1"
   },
   "devDependencies": {
+    "esbuild": "0.28.2",
+    "fake-indexeddb": "6.2.8",
     "wrangler": "^4.0.0"
   },
-  "engines": { "node": ">=22.13" }
+  "engines": {
+    "node": ">=22.13"
+  }
 }
