@@ -2,17 +2,25 @@ import {authenticate,checkMutation} from './auth.js';
 import {handleEntries,expose} from './entries.js';
 import {handleReports} from './reports.js';
 import {handleExport} from './export.js';
+import {handleSync} from './sync.js';
+import {handleLlmConfig} from './llm.js';
 import {bounds,metrics} from './calendar.js';
 const json=(x,status=200)=>Response.json(x,{status,headers:{'Cache-Control':'no-store'}});
 const err=(code,message,status=400,extra={})=>json({error:{code,message},...extra},status);
-const exposeSettings=(s,env)=>({...s,pinned_actions:JSON.parse(s.pinned_actions_json),has_key:!!env.LLM_API_KEY});
-const settings=async env=>exposeSettings(await env.DB.prepare('SELECT * FROM settings WHERE id=1').first(),env);
-function requireTimezone(s,tz,env){if(s.timezone!==tz){const e=new Error('TIMEZONE_CHANGED');e.currentSettings=exposeSettings(s,env);throw e;}}
+const exposeSettings = s => ({
+  timezone: s.timezone,
+  pinned_actions: JSON.parse(s.pinned_actions_json),
+  analysis_context: s.analysis_context,
+  revision: s.revision,
+  data_revision: s.data_revision,
+});
+const settings=async env=>exposeSettings(await env.DB.prepare('SELECT * FROM settings WHERE id=1').first());
+function requireTimezone(s,tz){if(s.timezone!==tz){const e=new Error('TIMEZONE_CHANGED');e.currentSettings=exposeSettings(s);throw e;}}
 async function periodData(env,date,tz,kind='day') {
  const b=bounds(date,tz,kind);
  const [e,n,s]=await env.DB.batch([env.DB.prepare('SELECT * FROM entries WHERE (started_at < ? AND (ended_at IS NULL OR ended_at > ?)) OR (started_at >= ? AND started_at < ? AND ended_at = started_at) ORDER BY started_at DESC,id DESC').bind(b.end,b.start,b.start,b.end),env.DB.prepare('SELECT * FROM day_notes WHERE date>=? AND date<? ORDER BY date').bind(b.from,b.to),env.DB.prepare('SELECT * FROM settings WHERE id=1')]);
  const entries=e.results.map(expose), notes=n.results, st=s.results[0];
- requireTimezone(st,tz,env);
+ requireTimezone(st,tz);
  return {entries,notes,metrics:metrics(entries,notes,b,tz),data_revision:st.data_revision, bounds:b};
 }
 export default {async fetch(request,env,ctx) {
@@ -21,13 +29,15 @@ export default {async fetch(request,env,ctx) {
  try {
  const auth=await authenticate(request,env);if(auth)return auth;
  if(!['GET','HEAD'].includes(request.method)){const blocked=checkMutation(request);if(blocked)return blocked;}
+ const synced=await handleSync(request,env);if(synced)return synced;
+ const llmConfig=await handleLlmConfig(request,env);if(llmConfig)return llmConfig;
  const exported=await handleExport(request,env);if(exported)return exported;
  const report=await handleReports(request,env,{getReportSnapshot:async(kind,date,tz)=>{const x=await periodData(env,date,tz,kind);return x.entries.length||x.notes.length?x:null;}}); if(report)return report;
  const handled=await handleEntries(request,env);if(handled)return handled;
  const db=env.DB, method=request.method;
  if(path==='/api/settings'&&method==='GET')return json(await settings(env));
  if(path==='/api/settings'&&method==='PATCH') {
-  const b=await request.json(), current=await settings(env), allowed=['timezone','analysis_context','llm_provider','llm_base_url','llm_model'];
+  const b=await request.json(), current=await settings(env), allowed=['timezone','analysis_context'];
   if(b.timezone)bounds('2026-01-01',b.timezone);
   const values={};for(const k of allowed)if(Object.hasOwn(b,k)){if(b[k]!==null&&(typeof b[k]!=='string'||b[k].length>2000))throw Error('INVALID_SETTINGS');values[k]=b[k];}
   if(Object.hasOwn(b,'pinned_actions')){
@@ -43,7 +53,7 @@ export default {async fetch(request,env,ctx) {
  if(path==='/api/snapshot'&&method==='GET') {
   const date=url.searchParams.get('date'),tz=url.searchParams.get('timezone'),b=bounds(date,tz);
   const [e,n,a,s]=await db.batch([db.prepare('SELECT * FROM entries WHERE (started_at<? AND (ended_at IS NULL OR ended_at>?)) OR (started_at>=? AND started_at<? AND ended_at=started_at) ORDER BY started_at DESC,id DESC').bind(b.end,b.start,b.start,b.end),db.prepare('SELECT * FROM day_notes WHERE date=?').bind(date),db.prepare('SELECT * FROM entries WHERE ended_at IS NULL'),db.prepare('SELECT * FROM settings WHERE id=1')]);
-  const st=s.results[0];requireTimezone(st,tz,env);return json({query_key:url.search,entries:e.results.map(expose),day_note:n.results[0]||null,active_entry:expose(a.results[0])||null,settings:exposeSettings(st,env),data_revision:st.data_revision,server_now:Date.now()});
+  const st=s.results[0];requireTimezone(st,tz);return json({query_key:url.search,entries:e.results.map(expose),day_note:n.results[0]||null,active_entry:expose(a.results[0])||null,settings:exposeSettings(st),data_revision:st.data_revision,server_now:Date.now()});
  }
  if(path==='/api/stats'&&method==='GET'){const kind=url.searchParams.get('kind')==='week'?'week':'day';return json(await periodData(env,url.searchParams.get('date'),url.searchParams.get('timezone'),kind));}
  if(path==='/api/entries'&&method==='GET') {
@@ -51,7 +61,7 @@ export default {async fetch(request,env,ctx) {
   let cursor=null;try{if(url.searchParams.get('cursor'))cursor=JSON.parse(atob(url.searchParams.get('cursor')));}catch{return err('INVALID_CURSOR','Некорректная страница');}
   const src=url.searchParams.get('source'),kind=url.searchParams.get('kind'),q=url.searchParams.get('q');
   const [e,s]=await db.batch([db.prepare(`SELECT * FROM entries WHERE ((started_at<? AND (ended_at IS NULL OR ended_at>?)) OR (started_at>=? AND started_at<? AND ended_at=started_at)) AND (? IS NULL OR source_name=?) AND (? IS NULL OR kind=?) AND (? IS NULL OR instr(lower(coalesce(note,'')),lower(?))>0) AND (? IS NULL OR started_at<? OR (started_at=? AND id<?)) ORDER BY started_at DESC,id DESC LIMIT ?`).bind(to,from,from,to,src,src,kind,kind,q,q,cursor?.[0]??null,cursor?.[0]??null,cursor?.[0]??null,cursor?.[1]??null,limit+1),db.prepare('SELECT * FROM settings WHERE id=1')]);
-  requireTimezone(s.results[0],tz,env);
+  requireTimezone(s.results[0],tz);
   const more=e.results.length>limit, rows=e.results.slice(0,limit),last=rows.at(-1);return json({entries:rows.map(expose),has_more:more,next_cursor:more?btoa(JSON.stringify([last.started_at,last.id])):null,data_revision:s.results[0].data_revision,query_key:url.search});
  }
  const note=path.match(/^\/api\/day-notes\/(\d{4}-\d{2}-\d{2})$/);
