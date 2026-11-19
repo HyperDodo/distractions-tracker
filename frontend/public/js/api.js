@@ -1,13 +1,19 @@
 export class ApiError extends Error {
   constructor(status, payload) {
+    const error = payload?.error;
+    const code = typeof error === 'string' ? error : error?.code;
     const messages = {
+      AUTH_CONFIGURATION_ERROR: 'Вход в приложение ещё не настроен.',
+      SYNC_UNAVAILABLE: 'Синхронизация временно недоступна.',
       EMPTY_PERIOD: 'За этот период пока нет данных для разбора.',
       INVALID_PERIOD: 'Проверьте выбранную дату и часовой пояс.',
       DELETED: 'Этот разбор удалён.',
       ID_REUSE_CONFLICT: 'Идентификатор запроса уже использован.',
     };
-    super(payload?.error?.message || messages[payload?.error] || (status === 401 ? 'Необходимо восстановить вход' : status === 403 ? 'Доступ запрещён' : `Ошибка сервера (${status})`));
+    super((Object.hasOwn(messages, code) && messages[code]) || error?.message ||
+      (status === 401 ? 'Необходимо восстановить вход' : status === 403 ? 'Доступ запрещён' : `Ошибка сервера (${status})`));
     this.status = status;
+    this.code = code;
     this.payload = payload;
   }
 }

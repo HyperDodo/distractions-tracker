@@ -9,6 +9,10 @@ const kinds = ['Согласование', 'Проблема', 'Координа
 const reasons = ['Нужны мои полномочия', 'У сотрудника нет полномочий', 'Не хватает знаний или опыта', 'Нет назначенного ответственного', 'Решение передали мне', 'Не знаю / другое'];
 const sections = [['today', 'Сегодня'], ['history', 'Журнал'], ['analysis', 'Разбор'], ['settings', 'Настройки']];
 const providers = [['', 'Встроенный OpenRouter Free'], ['openrouter', 'OpenRouter'], ['cheapai', 'CheapAI'], ['custom', 'Свой провайдер']];
+const modelCatalogues = new Map([
+  ['openrouter', 'https://openrouter.ai/models'],
+  ['cheapai', 'https://cheapai.io/docs?tab=models'],
+]);
 const metricLabels = {
   started_count: 'началось', total_duration_ms: 'сумма длительностей', median_duration_ms: 'медиана',
   short_count: 'короче пяти минут', estimated_count: 'приблизительных', missing_source: 'без источника',
@@ -168,20 +172,38 @@ function reportContent(report) {
 }
 
 function reportError(code) {
+  if (/^PROVIDER_HTTP_3\d\d$/.test(code || '')) code = 'PROVIDER_REDIRECT';
   return ({
     PROVIDER_HTTP_401: 'Провайдер отклонил токен.',
     PROVIDER_HTTP_403: 'Провайдер отказал в доступе.',
     PROVIDER_HTTP_429: 'Провайдер ограничил запросы. Попробуйте позже.',
     TIMEOUT: 'Провайдер не ответил вовремя.',
     PROVIDER_UNREACHABLE: 'Не удалось связаться с провайдером.',
+    PROVIDER_REDIRECT: 'Провайдер вернул перенаправление. Проверьте адрес API.',
+    INVALID_PROVIDER_RESPONSE: 'Провайдер вернул некорректный ответ API.',
+    PROVIDER_ERROR: 'Провайдер сообщил об ошибке обработки запроса.',
     INVALID_MODEL_JSON: 'Модель вернула ответ в другом формате.',
     INVALID_MODEL_RESULT: 'Ответ модели не прошёл проверку.',
   })[code] || (code ? 'Проверьте подключение и ID модели в настройках.' : '');
 }
 
+function probeUsage(report) {
+  if (!report) return '';
+  const details = [];
+  for (const [key, label] of [['input_tokens', 'Входные токены'], ['output_tokens', 'Выходные токены']]) {
+    const count = report[key];
+    if (Number.isInteger(count) && count >= 0) details.push(`${label} ${count.toLocaleString('ru-RU')}`);
+  }
+  if (report.provider === 'openrouter' && Number.isFinite(report.cost) && report.cost >= 0) {
+    details.push(`Стоимость ${report.cost.toLocaleString('ru-RU', { maximumSignificantDigits: 6 })} кредитов OpenRouter`);
+  }
+  return details.length ? `${details.join(' · ')}.` : '';
+}
+
 function reportConnectionHint() {
   if (!navigator.onLine || model?.error?.status === 0) return 'Для нового разбора нужен интернет.';
-  if (model?.error?.status === 401 || model?.error?.status === 403) return 'Войдите, чтобы запустить разбор.';
+  if (model?.error?.status === 401) return 'Войдите, чтобы запустить разбор.';
+  if (model?.error) return model.error.message;
   if (ui.configError && !ui.config) return ui.configError;
   if (!ui.config) return 'Проверяем подключение к модели…';
   if (ui.config.provider) return 'Личное подключение. Применяется тариф выбранного провайдера.';
@@ -238,7 +260,9 @@ function providerSettings() {
     <div id="personal-provider" ${config.provider ? '' : 'hidden'}>
       <label class="field" id="base-url-field" ${config.provider === 'custom' ? '' : 'hidden'}>Base URL
         <input type="url" name="base_url" placeholder="https://example.com/v1" value="${escape(config.provider === 'custom' ? config.base_url : '')}" ${config.provider === 'custom' ? 'required' : ''}></label>
-      <label class="field">Модель<input name="model" value="${escape(config.model)}" ${config.provider ? 'required' : ''}></label>
+      <label class="field">ID модели<input name="model" aria-describedby="model-help" value="${escape(config.model)}" ${config.provider ? 'required' : ''}></label>
+      <p class="muted" id="model-help">Скопируйте точный ID модели из каталога провайдера.
+        <a id="model-catalog" target="_blank" rel="noopener noreferrer" hidden>Открыть каталог моделей</a></p>
       <label class="field">Токен<input type="password" name="token" autocomplete="new-password" spellcheck="false"></label>
       <p class="muted" id="token-status">${config.has_token ? 'Токен сохранён. Оставьте поле пустым, чтобы сохранить его для этого провайдера.' : 'Введите токен своего провайдера.'}</p>
     </div>
@@ -370,20 +394,29 @@ function conflictNotice(conflict) {
 }
 
 function syncStatus() {
+  const error = model?.error;
+  if (error?.code === 'AUTH_CONFIGURATION_ERROR') return 'Требуется настройка входа';
+  if (error?.status === 401) return 'Нужно войти';
+  if (error?.status === 403) return 'Доступ запрещён';
+  if (error && error.status !== 0) return 'Синхронизация недоступна';
+  if (error?.status === 0 || !navigator.onLine) return model?.pending ? `Без сети · в очереди ${model.pending}` : 'Без сети';
   if (!model?.ready) return 'Первая синхронизация';
   if (model.conflict) return 'Синхронизация ждёт решения';
-  if (model.error?.status === 401 || model.error?.status === 403) return 'Нужно войти';
-  if (model.error || !navigator.onLine) return model.pending ? `Без сети · в очереди ${model.pending}` : 'Без сети';
   if (model.pending) return `На устройстве · в очереди ${model.pending}`;
   return model.syncing ? 'Синхронизация…' : 'Синхронизировано';
 }
 
 function syncNotice() {
   const error = model?.error;
-  const access = error && [401, 403].includes(error.status);
-  const failure = error && error.status !== 0 && !access;
-  return `${access ? '<div class="card warning">Восстановите вход для синхронизации. Записи на устройстве сохранены. <a href="/">Войти</a></div>' : ''}
-    ${failure ? `<div class="card warning">${escape(error.message)} <button class="secondary" id="sync-retry">Повторить</button></div>` : ''}
+  const retry = '<button class="secondary" id="sync-retry">Повторить</button>';
+  const setup = error?.code === 'AUTH_CONFIGURATION_ERROR';
+  const login = error?.status === 401;
+  const denied = error?.status === 403;
+  const statusMessage = setup ? `${escape(error.message)} Владелец приложения должен настроить Cloudflare Access. ${retry}` :
+    login ? `Войдите, чтобы синхронизировать журнал. ${model.ready ? 'Записи на устройстве сохранены. ' : ''}<a href="/">Войти</a>` :
+    denied ? 'Доступ к журналу для этого аккаунта запрещён. Используйте разрешённый email.' :
+    error && error.status !== 0 ? `${escape(error.message)} ${retry}` : '';
+  return `${statusMessage ? `<div class="card warning" role="alert">${statusMessage}</div>` : ''}
     ${model?.conflict ? conflictNotice(model.conflict) : ''}
     ${model?.ready && Math.abs(clockSkew()) >= 60000 ? '<div class="card warning">Часы устройства заметно отличаются от серверных.</div>' : ''}`;
 }
@@ -426,6 +459,8 @@ function updateSyncStatus() {
   updateAnalysisControls();
   const status = document.getElementById('sync-status');
   const notice = document.getElementById('sync-notice');
+  const bootstrap = document.getElementById('sync-bootstrap');
+  if (bootstrap) bootstrap.hidden = Boolean(model?.error && model.error.status !== 0);
   if (status) {
     const text = syncStatus();
     if (status.textContent !== text) status.textContent = text;
@@ -457,7 +492,7 @@ function render() {
   const message = ui.message && `<div class="card warning" role="alert">${escape(ui.message)}</div>`;
   if (!model?.ready) {
     app.innerHTML = `${header}<main><div id="sync-notice"></div>${message || ''}
-      <div class="card"><h1>Загружаем журнал</h1>
+      <div class="card" id="sync-bootstrap"><h1>Первая синхронизация</h1>
       <p>Для первой синхронизации нужен интернет и вход в приложение.</p>
       <button class="secondary" id="first-sync">Повторить</button></div></main>`;
     onClick('first-sync', () => { void store.sync(); });
@@ -589,6 +624,11 @@ function updateProviderFields(form) {
   form.elements.base_url.disabled = !custom;
   form.elements.model.required = !!provider;
   form.elements.token.required = Boolean(provider && (changed || !ui.config.has_token));
+  const catalogue = form.querySelector('#model-catalog');
+  const catalogueUrl = modelCatalogues.get(provider);
+  catalogue.hidden = !catalogueUrl;
+  if (catalogueUrl) catalogue.href = catalogueUrl;
+  else catalogue.removeAttribute('href');
   document.getElementById('test-model').disabled = ui.draftForm || (!ui.config.has_token && !ui.config.free_available);
 }
 
@@ -653,8 +693,10 @@ function bindProvider() {
     button.disabled = true;
     try {
       const data = await send('/api/llm/test', 'POST', { report_id: crypto.randomUUID() });
-      ui.configError = data.report?.status === 'completed' ? 'Подключение работает.' :
-        reportError(data.report?.error_code) || 'Проверка пока не завершилась.';
+      const report = data.report;
+      const message = report?.status === 'completed' ? 'Подключение работает.' :
+        reportError(report?.error_code) || 'Проверка пока не завершилась.';
+      ui.configError = [message, probeUsage(report)].filter(Boolean).join(' ');
     } catch (error) {
       ui.configError = error.message;
     }

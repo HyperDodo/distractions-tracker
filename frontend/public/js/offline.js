@@ -141,8 +141,8 @@ function listByKind(view, kind) {
 
 function problem(error) {
   return {
-    status: error.status ?? 0,
-    code: error.payload?.error?.code ?? 'SYNC_UNAVAILABLE',
+    status: error.status ?? 500,
+    code: error.code ?? 'SYNC_UNAVAILABLE',
     message: error.message || 'Не удалось синхронизировать журнал',
   };
 }

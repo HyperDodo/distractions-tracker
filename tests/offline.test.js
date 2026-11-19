@@ -18,7 +18,7 @@ function fixture(t) {
   const posts = [];
   const applied = [];
   let sequence = 0;
-  const server = { posts, applied, loseResponse: false, responseGate: null, pageSize: 100, afterGet: null };
+  const server = { posts, applied, loseResponse: false, responseGate: null, pageSize: 100, afterGet: null, getError: null };
   const key = (kind, id) => `${kind}:${id}`;
   function put(kind, id, value) {
     const change = { seq: ++sequence, kind, id: String(id), value };
@@ -36,6 +36,7 @@ function fixture(t) {
   const fetch = async (path, options) => {
     const params = new URL(path, 'https://offline.test').searchParams;
     if (options.method !== 'POST') {
+      if (server.getError) return Response.json(server.getError.body, { status: server.getError.status });
       const after = Number(params.get('after') ?? 0), through = Number(params.get('through') ?? sequence);
       if (after > sequence || through > sequence) return Response.json({ error: { code: 'SYNC_CURSOR_EXPIRED', message: 'Курсор устарел' } }, { status: 409 });
       const found = [...rows.values()].filter(change => after < change.seq && change.seq <= through).sort((a, b) => a.seq - b.seq);
@@ -102,6 +103,31 @@ function fixture(t) {
   };
   return { navigator, open, server, storage };
 }
+
+test('незавершённая настройка входа отличается от временного сбоя синхронизации', async t => {
+  const { navigator, open, server } = fixture(t);
+  const store = await open();
+  server.getError = { status: 503, body: { error: { code: 'AUTH_CONFIGURATION_ERROR' } } };
+  assert.equal(await store.sync(), false);
+  assert.equal(store.state.ready, false);
+  assert.deepEqual(store.state.error, {
+    status: 503, code: 'AUTH_CONFIGURATION_ERROR', message: 'Вход в приложение ещё не настроен.',
+  });
+  await assert.rejects(store.enqueue('entry.create', { id: 'early', started_at: 1000 }), /Сначала загрузите журнал/);
+
+  server.getError = null;
+  assert.equal(await store.sync(), true);
+  navigator.onLine = false;
+  await store.enqueue('entry.create', { id: 'later', started_at: 2000 });
+  navigator.onLine = true;
+  server.getError = { status: 503, body: { error: { code: 'SYNC_UNAVAILABLE', message: 'Синхронизация временно недоступна' } } };
+  assert.equal(await store.sync(), false);
+  assert.equal(store.state.ready, true);
+  assert.equal(store.state.pending, 1);
+  assert.deepEqual(store.state.error, {
+    status: 503, code: 'SYNC_UNAVAILABLE', message: 'Синхронизация временно недоступна.',
+  });
+});
 
 test('несколько офлайн-записей переживают перезапуск, законченный таймер отправляется один раз', async t => {
   const { navigator, open, server } = fixture(t);

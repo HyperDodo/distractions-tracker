@@ -14,6 +14,10 @@ const configRequest = (method, body) => new Request('https://tracker.example.com
 const testRequest = (id = crypto.randomUUID()) => new Request('https://tracker.example.com/api/llm/test', {
   method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ report_id: id }),
 });
+const reportRequest = (id = crypto.randomUUID()) => new Request('https://tracker.example.com/api/reports', {
+  method: 'POST', body: JSON.stringify({ report_id: id, kind: 'day', date: '2026-10-25', timezone: 'UTC' }),
+});
+const reportContext = { getReportSnapshot: () => ({ entries: [{ id: 'example' }], metrics: {} }) };
 
 function fixture(t) {
   const sql = new DatabaseSync(':memory:');
@@ -71,12 +75,10 @@ test('free OpenRouter uses the dedicated secret and a fixed endpoint, and stops 
     const unavailable = await handleReports(testRequest(), legacyEnv, {});
     assert.equal((await unavailable.json()).error.code, 'LLM_NOT_CONFIGURED');
     assert.equal(calls.length, 0);
-    const request = new Request('https://tracker.example.com/api/reports', {
-      method: 'POST', body: JSON.stringify({ report_id: crypto.randomUUID(), kind: 'day', date: '2026-10-25', timezone: 'UTC' }),
-    });
-    const result = await handleReports(request, env, { getReportSnapshot: () => ({ entries: [{ id: 'example' }], metrics: {} }) });
+    const result = await handleReports(reportRequest(), env, reportContext);
     const { report } = await result.json();
-    assert.equal(report.error_code, 'PROVIDER_HTTP_307');
+    assert.equal(report.status, 'failed');
+    assert.equal(report.error_code, 'PROVIDER_REDIRECT');
     assert.equal(calls.length, 1);
     assert.equal(calls[0].url, 'https://openrouter.ai/api/v1/chat/completions');
     assert.equal(calls[0].options.headers.Authorization, `Bearer ${secret}`);
@@ -85,6 +87,65 @@ test('free OpenRouter uses the dedicated secret and a fixed endpoint, and stops 
     assert.equal(payload.model, 'openrouter/free');
     assert.equal(payload.response_format.type, 'json_schema');
   } finally { globalThis.fetch = original; }
+});
+
+test('connection probes accept compatible completions without storing the provider response', async t => {
+  const { env } = fixture(t);
+  const fixtureText = 'upstream-private-content';
+  const responses = [
+    [{ message: { content: fixtureText } }, null],
+    [{ message: { role: 'assistant', content: null }, finish_reason: 'length' }, null],
+    [{ message: { role: 'assistant', content: '', reasoning: fixtureText }, finish_reason: 'stop' }, null],
+    [{ message: { role: 'assistant', content: '' }, finish_reason: 'stop' }, 'INVALID_MODEL_RESULT'],
+    [{ message: { role: 'assistant', content: fixtureText, refusal: 'declined' } }, 'INVALID_MODEL_RESULT'],
+    [{ message: { content: fixtureText }, finish_reason: 'content_filter' }, 'INVALID_MODEL_RESULT'],
+    [{ message: { role: 'assistant', content: fixtureText }, error: { message: fixtureText } }, 'PROVIDER_ERROR'],
+  ];
+  const fetch = t.mock.method(globalThis, 'fetch', () => { throw new Error('Unexpected provider call'); });
+  for (const [choice, error] of responses) {
+    fetch.mock.mockImplementationOnce(async () => Response.json({
+      choices: [choice], usage: { prompt_tokens: 4, completion_tokens: 12, cost: 0 },
+    }));
+    const response = await handleReports(testRequest(), env, {});
+    const text = await response.text();
+    const { report } = JSON.parse(text);
+    assert.equal(report.status, error ? 'failed' : 'completed');
+    assert.equal(report.error_code, error);
+    assert.equal(report.result_json, error ? null : JSON.stringify({ message: 'OK' }));
+    assert.deepEqual([report.input_tokens, report.output_tokens, report.cost], [4, 12, 0]);
+    assert.ok(!text.includes(fixtureText));
+  }
+  assert.equal(fetch.mock.callCount(), responses.length);
+  const payload = JSON.parse(fetch.mock.calls[0].arguments[1].body);
+  assert.equal(payload.max_tokens, 128);
+  assert.deepEqual(payload.messages, [{ role: 'user', content: 'Respond OK.' }]);
+});
+
+test('a known bad provider response stays distinct from invalid model output and transport failures', async t => {
+  const { env } = fixture(t);
+  const fixtureText = 'upstream-private-content';
+  const responses = [
+    [() => new Response(`<html>${fixtureText}</html>`), 'failed', 'INVALID_PROVIDER_RESPONSE'],
+    [() => Response.json({ choices: [{ message: null }] }), 'failed', 'INVALID_PROVIDER_RESPONSE'],
+    [() => Response.json({ choices: [{ message: { content: fixtureText } }] }), 'failed', 'INVALID_MODEL_JSON'],
+    [() => { throw new TypeError(fixtureText); }, 'unknown', 'PROVIDER_UNREACHABLE'],
+    [() => { throw new DOMException(fixtureText, 'AbortError'); }, 'unknown', 'TIMEOUT'],
+  ];
+  const fetch = t.mock.method(globalThis, 'fetch', () => { throw new Error('Unexpected provider call'); });
+  for (const [reply, status, error] of responses) {
+    fetch.mock.mockImplementationOnce(reply);
+    const id = crypto.randomUUID();
+    const response = await handleReports(reportRequest(id), env, reportContext);
+    const text = await response.text();
+    const { report } = JSON.parse(text);
+    assert.equal(report.status, status);
+    assert.equal(report.error_code, error);
+    assert.equal(report.result_json, null);
+    assert.ok(!text.includes(fixtureText));
+    const retry = await handleReports(reportRequest(id), env, reportContext);
+    assert.equal((await retry.json()).report.error_code, error);
+  }
+  assert.equal(fetch.mock.callCount(), responses.length);
 });
 
 test('the chosen connection is encrypted, its destination binds the token, and a provider error stays with it', async t => {
