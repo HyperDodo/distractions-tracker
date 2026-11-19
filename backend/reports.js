@@ -5,6 +5,31 @@ const json = (body, status = 200) => Response.json(body, { status, headers: { 'C
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const day = /^\d{4}-\d{2}-\d{2}$/;
 const iso = d => d.toISOString().slice(0, 10);
+const openRouterBudgetErrors = new Map([
+  ['openrouter_key_limit', 'OPENROUTER_403_KEY_LIMIT'],
+  ['openrouter_workspace_budget', 'OPENROUTER_403_WORKSPACE_BUDGET'],
+  ['openrouter_guardrail_budget', 'OPENROUTER_403_GUARDRAIL_BUDGET'],
+]);
+const openRouterForbiddenMessageRules = [
+  ['OPENROUTER_403_BUDGET', [
+    /\b(?:budget|credit limit|spending limit)(?: limit)? (?:exceeded|exhausted|reached)\b/i,
+  ]],
+  ['OPENROUTER_403_REGION', [
+    /\b(?:arrived on the [\w-]+ data region|permits requests only on these OpenRouter hostnames)\b/i,
+    /\b(?:country|region|IP(?: address)?) (?:is |are )?(?:blocked|restricted|unsupported|not (?:allowed|permitted|supported))\b/i,
+    /\b(?:not (?:available|allowed|permitted|supported)|blocked|restricted) (?:in|from) (?:this|your) (?:country|region|IP(?: address)?)\b/i,
+    /\bIP(?: address)? (?:is )?not (?:in|on) (?:the |an? )?(?:allowlist|whitelist)\b/i,
+  ]],
+  ['OPENROUTER_403_SAFETY', [
+    /\brequest (?:was )?blocked(?: by|:)\s*(?:content filter|prompt injection)\b/i,
+    /\b(?:content policy violation|prompt injection patterns detected|(?:input|output|prompt) (?:was )?flagged|(?:model|provider) refused to respond)\b/i,
+  ]],
+  ['OPENROUTER_403_PERMISSION', [
+    /\b(?:permission denied|insufficient permissions|(?:model|provider) (?:is |are )?not (?:allowed|permitted|authorized))\b/i,
+    /\bnot (?:allowed|permitted|authorized) to (?:use|access) (?:this |the )?(?:model|provider)\b/i,
+    /\b(?:do(?:es)? not have|lacks?) (?:the )?(?:required )?(?:permission|access) to (?:use |access )?(?:this |the )?(?:model|provider)\b/i,
+  ]],
+];
 const reportTextFields = ['summary', 'necessary_participation', 'hypotheses', 'limitations', 'experiment'];
 const reportSchema = {
   type: 'object',
@@ -94,6 +119,52 @@ function decodeCompletion(text, connection, snapshot, isTest) {
   return { result, usage };
 }
 
+function openRouterForbiddenReason(error) {
+  const metadata = error?.metadata;
+  const budget = openRouterBudgetErrors.get(metadata?.limit_source);
+  if (budget) return budget;
+
+  const type = metadata?.error_type;
+  if (type === 'content_policy_violation' || type === 'refusal'
+      || (hasText(metadata?.flagged_input) && Array.isArray(metadata.reasons) && metadata.reasons.length > 0)) {
+    return 'OPENROUTER_403_SAFETY';
+  }
+
+  const message = typeof error?.message === 'string' ? error.message.slice(0, 512) : '';
+  const match = openRouterForbiddenMessageRules.find(([, patterns]) => patterns.some(pattern => pattern.test(message)));
+  return match?.[0] ?? (type === 'permission_denied' ? 'OPENROUTER_403_PERMISSION' : 'PROVIDER_HTTP_403');
+}
+
+async function diagnoseOpenRouterForbidden(response) {
+  const defaultError = 'PROVIDER_HTTP_403';
+  const reader = response.body?.getReader();
+  if (!reader) return defaultError;
+
+  // Upstream errors can include quoted prompts or provider credentials. Inspect only
+  // a small JSON body and return a fixed code. Discard every upstream field.
+  const bytes = new Uint8Array(8192);
+  let length = 0;
+  let fullyRead = false;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) {
+        fullyRead = true;
+        const body = JSON.parse(new TextDecoder().decode(bytes.subarray(0, length)));
+        return openRouterForbiddenReason(body?.error);
+      }
+      if (length + value.byteLength > bytes.length) return defaultError;
+      bytes.set(value, length);
+      length += value.byteLength;
+    }
+  } catch {
+    return defaultError;
+  } finally {
+    if (!fullyRead) void reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+
 async function reserve(request, env, snapshotFn, isTest) {
   let body;
   try { body = await request.json(); } catch { return json({ error: 'INVALID_JSON' }, 400); }
@@ -153,6 +224,7 @@ async function reserve(request, env, snapshotFn, isTest) {
       body: JSON.stringify(payload),
     });
     if (response.status >= 300 && response.status < 400) error = 'PROVIDER_REDIRECT';
+    else if (response.status === 403 && connection.provider === 'openrouter') error = await diagnoseOpenRouterForbidden(response);
     else if (!response.ok) error = `PROVIDER_HTTP_${response.status}`;
     else {
       ({ result = null, usage = null, error = null } = decodeCompletion(await response.text(), connection, snapshot, isTest));

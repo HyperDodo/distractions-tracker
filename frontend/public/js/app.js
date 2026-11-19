@@ -8,7 +8,7 @@ const app = document.querySelector('#app');
 const kinds = ['Согласование', 'Проблема', 'Координация', 'Сделать руками', 'Сам отвлёкся', 'Другое'];
 const reasons = ['Нужны мои полномочия', 'У сотрудника нет полномочий', 'Не хватает знаний или опыта', 'Нет назначенного ответственного', 'Решение передали мне', 'Не знаю / другое'];
 const sections = [['today', 'Сегодня'], ['history', 'Журнал'], ['analysis', 'Разбор'], ['settings', 'Настройки']];
-const providers = [['', 'Встроенный OpenRouter Free'], ['openrouter', 'OpenRouter'], ['cheapai', 'CheapAI'], ['custom', 'Свой провайдер']];
+const providers = [['', 'Встроенный OpenRouter'], ['openrouter', 'OpenRouter'], ['cheapai', 'CheapAI'], ['custom', 'Свой провайдер']];
 const modelCatalogues = new Map([
   ['openrouter', 'https://openrouter.ai/models'],
   ['cheapai', 'https://cheapai.io/docs?tab=models'],
@@ -175,8 +175,15 @@ function reportError(code) {
   if (/^PROVIDER_HTTP_3\d\d$/.test(code || '')) code = 'PROVIDER_REDIRECT';
   return ({
     PROVIDER_HTTP_401: 'Провайдер отклонил токен.',
-    PROVIDER_HTTP_403: 'Провайдер отказал в доступе.',
+    PROVIDER_HTTP_403: 'Провайдер отказал в доступе (HTTP 403). Проверьте права и лимиты API-ключа.',
     PROVIDER_HTTP_429: 'Провайдер ограничил запросы. Попробуйте позже.',
+    OPENROUTER_403_KEY_LIMIT: 'Исчерпан лимит API-ключа OpenRouter. Проверьте бюджет ключа в OpenRouter.',
+    OPENROUTER_403_WORKSPACE_BUDGET: 'Исчерпан бюджет рабочего пространства OpenRouter. Проверьте его лимиты.',
+    OPENROUTER_403_GUARDRAIL_BUDGET: 'Исчерпан бюджет правила OpenRouter. Проверьте лимит в разделе Guardrails.',
+    OPENROUTER_403_BUDGET: 'OpenRouter сообщил об исчерпанном бюджете. Проверьте лимиты ключа и рабочего пространства.',
+    OPENROUTER_403_PERMISSION: 'OpenRouter ограничил доступ для этого запроса. Проверьте права ключа и разрешённые модели.',
+    OPENROUTER_403_SAFETY: 'OpenRouter или поставщик модели заблокировал запрос правилом безопасности. Проверьте политики в OpenRouter.',
+    OPENROUTER_403_REGION: 'OpenRouter ограничил доступ для региона или IP сервера, который отправил запрос.',
     TIMEOUT: 'Провайдер не ответил вовремя.',
     PROVIDER_UNREACHABLE: 'Не удалось связаться с провайдером.',
     PROVIDER_REDIRECT: 'Провайдер вернул перенаправление. Проверьте адрес API.',
@@ -200,6 +207,16 @@ function probeUsage(report) {
   return details.length ? `${details.join(' · ')}.` : '';
 }
 
+function connectionReady(config) {
+  return config?.provider ? config.has_token : Boolean(config?.default_available);
+}
+
+function builtInConnectionHint(config) {
+  if (!config.default_available) return 'Добавьте ключ и ID модели в настройках Worker в Cloudflare.';
+  const tariff = config.free_available ? 'Бесплатный маршрутизатор.' : 'Применяется тариф модели OpenRouter.';
+  return `Встроенный OpenRouter · ${config.default_model}. ${tariff}`;
+}
+
 function reportConnectionHint() {
   if (!navigator.onLine || model?.error?.status === 0) return 'Для нового разбора нужен интернет.';
   if (model?.error?.status === 401) return 'Войдите, чтобы запустить разбор.';
@@ -207,13 +224,12 @@ function reportConnectionHint() {
   if (ui.configError && !ui.config) return ui.configError;
   if (!ui.config) return 'Проверяем подключение к модели…';
   if (ui.config.provider) return 'Личное подключение. Применяется тариф выбранного провайдера.';
-  if (ui.config.free_available) return 'Встроенный OpenRouter Free.';
-  return 'Подключение можно настроить в настройках.';
+  return builtInConnectionHint(ui.config);
 }
 
 function reportAvailable() {
   return navigator.onLine && !model?.error && !ui.reportBusy && ui.report?.status !== 'pending'
-    && Boolean(ui.config?.has_token || ui.config?.free_available);
+    && connectionReady(ui.config);
 }
 
 function updateAnalysisControls() {
@@ -266,10 +282,9 @@ function providerSettings() {
       <label class="field">Токен<input type="password" name="token" autocomplete="new-password" spellcheck="false"></label>
       <p class="muted" id="token-status">${config.has_token ? 'Токен сохранён. Оставьте поле пустым, чтобы сохранить его для этого провайдера.' : 'Введите токен своего провайдера.'}</p>
     </div>
-    <p class="muted" id="free-provider" ${config.provider ? 'hidden' : ''}>${config.free_available ?
-      'Разбор использует бесплатные модели OpenRouter.' : 'Встроенный ключ ещё не настроен.'}</p>
+    <p class="muted" id="default-provider" ${config.provider ? 'hidden' : ''}>${escape(builtInConnectionHint(config))}</p>
     <div class="row"><button class="primary" ${ui.configBusy ? 'disabled' : ''}>Сохранить подключение</button>
-      <button class="secondary" type="button" id="test-model" ${ui.configBusy || (!config.has_token && !config.free_available) ? 'disabled' : ''}>Проверить модель</button></div>
+      <button class="secondary" type="button" id="test-model" ${ui.configBusy || !connectionReady(config) ? 'disabled' : ''}>Проверить модель</button></div>
     <p id="provider-message" class="notice" aria-live="polite">${escape(ui.configError)}</p>
   </form>`;
 }
@@ -618,7 +633,7 @@ function updateProviderFields(form) {
   const changed = provider && (provider !== ui.config.provider ||
     (custom && form.elements.base_url.value.replace(/\/$/, '') !== ui.config.base_url));
   document.getElementById('personal-provider').hidden = !provider;
-  document.getElementById('free-provider').hidden = !!provider;
+  document.getElementById('default-provider').hidden = !!provider;
   document.getElementById('base-url-field').hidden = !custom;
   form.elements.base_url.required = custom;
   form.elements.base_url.disabled = !custom;
@@ -629,7 +644,7 @@ function updateProviderFields(form) {
   catalogue.hidden = !catalogueUrl;
   if (catalogueUrl) catalogue.href = catalogueUrl;
   else catalogue.removeAttribute('href');
-  document.getElementById('test-model').disabled = ui.draftForm || (!ui.config.has_token && !ui.config.free_available);
+  document.getElementById('test-model').disabled = ui.draftForm || !connectionReady(ui.config);
 }
 
 async function loadProvider() {
@@ -688,7 +703,7 @@ function bindProvider() {
   };
   form.onsubmit = saveProvider;
   onClick('test-model', async () => {
-    if (ui.config.provider && !confirm('Проверка отправит тестовый запрос по тарифу провайдера. Продолжить?')) return;
+    if ((ui.config.provider || !ui.config.free_available) && !confirm('Проверка отправит тестовый запрос по тарифу провайдера. Продолжить?')) return;
     const button = document.getElementById('test-model');
     button.disabled = true;
     try {
@@ -829,7 +844,7 @@ async function pollReport() {
 
 async function runReport() {
   if (!reportAvailable()) return;
-  if (!confirm('Запустить разбор? С личным подключением применяется тариф поставщика.')) return;
+  if (!confirm('Запустить разбор? Стоимость зависит от тарифа выбранной модели.')) return;
   const { kind, date } = ui;
   ui.reportBusy = true;
   ui.message = '';

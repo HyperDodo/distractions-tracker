@@ -64,6 +64,8 @@ test('one report ID triggers at most one external request and deletion blocks re
 test('free OpenRouter uses the dedicated secret and a fixed endpoint, and stops at a redirect', async t => {
   const { sql, env } = fixture(t);
   sql.exec("UPDATE settings SET llm_base_url='https://other.example.com/v1', llm_model='paid' WHERE id=1");
+  const config = await (await handleLlmConfig(configRequest('GET'), env)).json();
+  assert.deepEqual([config.default_available, config.default_model, config.free_available], [true, 'openrouter/free', true]);
   const legacyEnv = { ...env, OPENROUTER_FREE_API_KEY: undefined, LLM_API_KEY: 'legacy-test-key' };
   const original = globalThis.fetch;
   const calls = [];
@@ -87,6 +89,74 @@ test('free OpenRouter uses the dedicated secret and a fixed endpoint, and stops 
     assert.equal(payload.model, 'openrouter/free');
     assert.equal(payload.response_format.type, 'json_schema');
   } finally { globalThis.fetch = original; }
+});
+
+test('a complete built-in OpenRouter pair uses its own model and yields to a saved personal connection', async t => {
+  const { env: legacy } = fixture(t);
+  const defaultToken = 'built-in-openrouter-test-token';
+  const personalToken = 'personal-cheapai-test-token';
+  const model = 'openai/gpt-4.1-mini';
+  const env = { ...legacy, OPENROUTER_DEFAULT_API_KEY: defaultToken, OPENROUTER_DEFAULT_MODEL: model };
+  const expectedDefaults = { default_available: true, default_model: model, free_available: false };
+  const fetch = t.mock.method(globalThis, 'fetch', () => { throw new Error('Unexpected provider call'); });
+
+  const config = await handleLlmConfig(configRequest('GET'), env);
+  assert.deepEqual(await config.json(), { provider: null, model: null, base_url: null, has_token: false, ...expectedDefaults });
+  const withFreeModel = await handleLlmConfig(configRequest('GET'), { ...env, OPENROUTER_DEFAULT_MODEL: 'openrouter/free' });
+  assert.deepEqual(await withFreeModel.json(), {
+    provider: null, model: null, base_url: null, has_token: false, default_available: true, default_model: 'openrouter/free', free_available: true,
+  });
+
+  fetch.mock.mockImplementationOnce(() => Response.json({ choices: [{ message: { content: 'OK' } }] }));
+  const builtIn = await handleReports(testRequest(), env, {});
+  const { report: builtInReport } = await builtIn.json();
+  assert.deepEqual([builtInReport.status, builtInReport.model], ['completed', model]);
+
+  const saved = await handleLlmConfig(configRequest('PUT', { provider: 'cheapai', model: 'personal-model', token: personalToken }), env);
+  assert.deepEqual(await saved.json(), {
+    provider: 'cheapai', model: 'personal-model', base_url: 'https://cheapai.io/v1', has_token: true, ...expectedDefaults,
+  });
+  fetch.mock.mockImplementationOnce(() => new Response(null, { status: 401 }));
+  const personal = await handleReports(testRequest(), env, {});
+  const { report: personalReport } = await personal.json();
+  assert.deepEqual([personalReport.status, personalReport.provider, personalReport.error_code], ['failed', 'cheapai', 'PROVIDER_HTTP_401']);
+
+  const cleared = await handleLlmConfig(configRequest('DELETE'), env);
+  assert.deepEqual(await cleared.json(), { provider: null, model: null, base_url: null, has_token: false, ...expectedDefaults });
+  assert.deepEqual(fetch.mock.calls.map(({ arguments: [url, options] }) =>
+    [url, options.headers.Authorization, JSON.parse(options.body).model]), [
+    ['https://openrouter.ai/api/v1/chat/completions', `Bearer ${defaultToken}`, model],
+    ['https://cheapai.io/v1/chat/completions', `Bearer ${personalToken}`, 'personal-model'],
+  ]);
+});
+
+test('incomplete or invalid built-in bindings never mix with the legacy free credential', async t => {
+  const { env: legacy } = fixture(t);
+  const key = 'built-in-openrouter-test-token';
+  const model = 'openai/gpt-4.1-mini';
+  const cases = [
+    { OPENROUTER_DEFAULT_API_KEY: key },
+    { OPENROUTER_DEFAULT_MODEL: model },
+    { OPENROUTER_DEFAULT_API_KEY: '', OPENROUTER_DEFAULT_MODEL: model },
+    { OPENROUTER_DEFAULT_API_KEY: 'invalid key', OPENROUTER_DEFAULT_MODEL: model },
+    ...['', ` ${model}`, `${model}\n`, 'openai/model with spaces', 'openai/model\u0007', 'x'.repeat(257), key].map(invalidModel =>
+      ({ OPENROUTER_DEFAULT_API_KEY: key, OPENROUTER_DEFAULT_MODEL: invalidModel })),
+  ];
+  const fetch = t.mock.method(globalThis, 'fetch', () => { throw new Error('Unexpected provider call'); });
+  for (const bindings of cases) {
+    const env = { ...legacy, ...bindings };
+    const config = await handleLlmConfig(configRequest('GET'), env);
+    assert.deepEqual(await config.json(), {
+      provider: null, model: null, base_url: null, has_token: false, default_available: false, default_model: null, free_available: false,
+    });
+    const result = await handleReports(testRequest(), env, {});
+    assert.equal(result.status, 400);
+    const { error } = await result.json();
+    assert.equal(error.code, 'LLM_NOT_CONFIGURED');
+    assert.match(error.message, /OPENROUTER_DEFAULT_API_KEY.*OPENROUTER_DEFAULT_MODEL/);
+    assert.ok(!error.message.includes(key));
+  }
+  assert.equal(fetch.mock.callCount(), 0);
 });
 
 test('connection probes accept compatible completions without storing the provider response', async t => {
@@ -148,6 +218,81 @@ test('a known bad provider response stays distinct from invalid model output and
   assert.equal(fetch.mock.callCount(), responses.length);
 });
 
+test('OpenRouter 403 details become safe codes without rerouting or retaining upstream text', async t => {
+  const { sql, env } = fixture(t);
+  const ownToken = 'personal-openrouter-test-token';
+  const configured = await handleLlmConfig(configRequest('PUT', {
+    provider: 'openrouter', model: 'openrouter/free', token: ownToken,
+  }), env);
+  assert.equal(configured.status, 200);
+
+  const secretDetails = 'upstream-private-authorization-and-prompt';
+  const cases = [
+    [{ limit_source: 'openrouter_key_limit' }, 'Forbidden', 'OPENROUTER_403_KEY_LIMIT'],
+    [{ limit_source: 'openrouter_workspace_budget' }, 'Forbidden', 'OPENROUTER_403_WORKSPACE_BUDGET'],
+    [{ limit_source: 'openrouter_guardrail_budget' }, 'Forbidden', 'OPENROUTER_403_GUARDRAIL_BUDGET'],
+    [{}, 'Budget limit exceeded (weekly limit).', 'OPENROUTER_403_BUDGET'],
+    [{ error_type: 'permission_denied' }, 'Forbidden', 'OPENROUTER_403_PERMISSION'],
+    [{}, 'This model is not allowed by the workspace.', 'OPENROUTER_403_PERMISSION'],
+    [{ error_type: 'content_policy_violation' }, 'Forbidden', 'OPENROUTER_403_SAFETY'],
+    [{ error_type: 'refusal' }, 'Forbidden', 'OPENROUTER_403_SAFETY'],
+    [{ reasons: ['safety'], flagged_input: secretDetails }, 'Forbidden', 'OPENROUTER_403_SAFETY'],
+    [{ error_type: 'permission_denied' }, 'Request blocked: prompt injection patterns detected', 'OPENROUTER_403_SAFETY'],
+    [{ error_type: 'permission_denied' }, 'This request arrived on the global data region, but the key’s workspace permits requests only on these OpenRouter hostnames: eu.openrouter.ai.', 'OPENROUTER_403_REGION'],
+    [{}, 'IP address is not on the allowlist.', 'OPENROUTER_403_REGION'],
+    [{ limit_source: 'unrecognized_budget', error_type: 'constructor' }, 'Forbidden', 'PROVIDER_HTTP_403'],
+  ];
+  const fetch = t.mock.method(globalThis, 'fetch', () => { throw new Error('Unexpected provider call'); });
+  for (const [metadata, message, expected] of cases) {
+    fetch.mock.mockImplementationOnce(() => Response.json({ error: {
+      code: 403, message: `${message} ${secretDetails}`, metadata: { ...metadata, raw: secretDetails },
+    } }, { status: 403 }));
+    const id = crypto.randomUUID();
+    const response = await handleReports(reportRequest(id), env, reportContext);
+    const text = await response.text();
+    const { report } = JSON.parse(text);
+    assert.deepEqual([report.status, report.error_code, report.result_json], ['failed', expected, null]);
+    assert.ok(!text.includes(secretDetails) && !text.includes(ownToken));
+    assert.ok(!JSON.stringify(sql.prepare('SELECT * FROM reports WHERE id=?').get(id)).includes(secretDetails));
+    const retry = await handleReports(reportRequest(id), env, reportContext);
+    assert.equal((await retry.json()).report.error_code, expected);
+  }
+  assert.equal(fetch.mock.callCount(), cases.length);
+  assert.ok(fetch.mock.calls.every(({ arguments: [url, options] }) =>
+    url === 'https://openrouter.ai/api/v1/chat/completions' && options.headers.Authorization === `Bearer ${ownToken}`));
+});
+
+test('unreadable or oversized 403s and non-OpenRouter 403s remain generic failures', async t => {
+  const { env } = fixture(t);
+  const providerBody = { error: { code: 403, metadata: { limit_source: 'openrouter_key_limit' } } };
+  let cancelled = false;
+  const oversizedBytes = new TextEncoder().encode(JSON.stringify({ ...providerBody, padding: '0'.repeat(8192) }));
+  const unreadable = new Response(new ReadableStream({ start(stream) { stream.error(new Error('unreadable')); } }), { status: 403 });
+  const oversized = new Response(new ReadableStream({
+    start(stream) { stream.enqueue(oversizedBytes); },
+    cancel() { cancelled = true; },
+  }), { status: 403 });
+
+  const fetch = t.mock.method(globalThis, 'fetch', () => { throw new Error('Unexpected provider call'); });
+  for (const body of [new Response('<html>Forbidden</html>', { status: 403 }), unreadable, oversized]) {
+    fetch.mock.mockImplementationOnce(() => body);
+    const response = await handleReports(testRequest(), env, {});
+    const { report } = await response.json();
+    assert.deepEqual([report.status, report.error_code], ['failed', 'PROVIDER_HTTP_403']);
+  }
+  assert.equal(cancelled, true);
+
+  const configured = await handleLlmConfig(configRequest('PUT', {
+    provider: 'cheapai', model: 'model-c', token: 'cheapai-test-token',
+  }), env);
+  assert.equal(configured.status, 200);
+  fetch.mock.mockImplementationOnce(() => Response.json(providerBody, { status: 403 }));
+  const response = await handleReports(testRequest(), env, {});
+  const { report } = await response.json();
+  assert.deepEqual([report.status, report.error_code], ['failed', 'PROVIDER_HTTP_403']);
+  assert.equal(fetch.mock.callCount(), 4);
+});
+
 test('the chosen connection is encrypted, its destination binds the token, and a provider error stays with it', async t => {
   const { sql, env } = fixture(t);
   const token = 'owned-provider-test-token';
@@ -162,7 +307,8 @@ test('the chosen connection is encrypted, its destination binds the token, and a
   assert.equal(missingStorage.status, 503);
   const saved = await handleLlmConfig(configRequest('PUT', { ...connection, token }), env);
   assert.deepEqual(await saved.json(), {
-    provider: 'custom', base_url: 'https://provider.example.com/v1', model: 'model-a', has_token: true, free_available: true,
+    provider: 'custom', base_url: 'https://provider.example.com/v1', model: 'model-a', has_token: true,
+    default_available: true, default_model: 'openrouter/free', free_available: true,
   });
   const encrypted = sql.prepare('SELECT encrypted_token FROM llm_config WHERE id=1').get().encrypted_token;
   assert.ok(!encrypted.includes(token));

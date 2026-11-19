@@ -1,11 +1,13 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   // Copy to wrangler.production.jsonc in the repository root.
-  // This copy is ignored by Git. See docs/cloudflare-deployment.md.
+  // This copy is ignored by Git. See README.md.
   "name": "interruption-tracker",
   "main": "backend/worker.js",
   "compatibility_date": "2026-06-01",
   "compatibility_flags": ["global_fetch_strictly_public"],
+  // Preserve settings entered in the Cloudflare Dashboard across deployments.
+  "keep_vars": true,
   "workers_dev": true,
   // Disables per-version URLs. Separate preview environments need their own protection.
   "preview_urls": false,
@@ -26,6 +28,6 @@
   // Keep empty for the FIRST bootstrap deployment of a NEW installation.
   // Enable Worker-wide Access before adding its real values here:
   // ACCESS_TEAM_DOMAIN, ACCESS_AUD, ACCESS_EMAIL.
-  // OPENROUTER_FREE_API_KEY and LLM_TOKEN_ENCRYPTION_KEY belong in Worker Secrets.
+  // Set OPENROUTER_DEFAULT_MODEL in Cloudflare. Store the API and encryption keys as Worker Secrets.
   "vars": {}
 }
