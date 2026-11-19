@@ -262,7 +262,7 @@ test('OpenRouter 403 details become safe codes without rerouting or retaining up
     url === 'https://openrouter.ai/api/v1/chat/completions' && options.headers.Authorization === `Bearer ${ownToken}`));
 });
 
-test('unreadable or oversized 403s and non-OpenRouter 403s remain generic failures', async t => {
+test('full-report and other-provider 403s do not run a credential check', async t => {
   const { env } = fixture(t);
   const providerBody = { error: { code: 403, metadata: { limit_source: 'openrouter_key_limit' } } };
   let cancelled = false;
@@ -274,11 +274,15 @@ test('unreadable or oversized 403s and non-OpenRouter 403s remain generic failur
   }), { status: 403 });
 
   const fetch = t.mock.method(globalThis, 'fetch', () => { throw new Error('Unexpected provider call'); });
-  for (const body of [new Response('<html>Forbidden</html>', { status: 403 }), unreadable, oversized]) {
+  const originalResponses = [
+    [new Response('<html>Forbidden</html>', { status: 403 }), 'OPENROUTER_403_NON_API'],
+    [unreadable, 'PROVIDER_HTTP_403'], [oversized, 'PROVIDER_HTTP_403'],
+  ];
+  for (const [body, expected] of originalResponses) {
     fetch.mock.mockImplementationOnce(() => body);
-    const response = await handleReports(testRequest(), env, {});
+    const response = await handleReports(reportRequest(), env, reportContext);
     const { report } = await response.json();
-    assert.deepEqual([report.status, report.error_code], ['failed', 'PROVIDER_HTTP_403']);
+    assert.deepEqual([report.status, report.error_code], ['failed', expected]);
   }
   assert.equal(cancelled, true);
 
@@ -291,6 +295,71 @@ test('unreadable or oversized 403s and non-OpenRouter 403s remain generic failur
   const { report } = await response.json();
   assert.deepEqual([report.status, report.error_code], ['failed', 'PROVIDER_HTTP_403']);
   assert.equal(fetch.mock.callCount(), 4);
+});
+
+test('an unclassified OpenRouter connection-test denial checks the same key once without retaining the response', async t => {
+  const { sql, env } = fixture(t);
+  const token = 'personal-openrouter-test-token';
+  const privateText = 'upstream-private-key-details';
+  const configured = await handleLlmConfig(configRequest('PUT', { provider: 'openrouter', model: 'meta-llama/llama-4-scout', token }), env);
+  assert.equal(configured.status, 200);
+  const generic = () => Response.json({ error: { code: 403, message: privateText } }, {
+    status: 403, headers: { 'cf-ray': '0123456789abcdef-TEST' },
+  });
+  const html = () => new Response(`<html>${privateText}</html>`, { status: 403, headers: { 'Content-Type': 'text/html' } });
+  const keyOk = () => Response.json({ data: { label: privateText } });
+  const cases = [
+    [generic, keyOk, 'OPENROUTER_403_CHAT_KEY_OK'],
+    [html, keyOk, 'OPENROUTER_403_NON_API_KEY_OK'],
+    [generic, () => new Response(privateText, { status: 401 }), 'OPENROUTER_403_KEY_UNAUTHORIZED'],
+    [generic, () => html(), 'OPENROUTER_403_KEY_DENIED'],
+    [generic, () => Response.json({ error: { metadata: { limit_source: 'openrouter_key_limit' } } }, { status: 403 }), 'OPENROUTER_403_KEY_LIMIT'],
+    [generic, () => new Response(privateText, { status: 403, headers: { 'cf-mitigated': 'challenge' } }), 'OPENROUTER_403_CHALLENGE'],
+    [generic, () => Response.json({ data: [] }), 'PROVIDER_HTTP_403'],
+    [generic, () => Response.json({ data: { label: '0'.repeat(8192) } }), 'PROVIDER_HTTP_403'],
+    [generic, () => Response.redirect('https://other.example.com/key', 307), 'PROVIDER_HTTP_403'],
+    [html, () => { throw new DOMException(privateText, 'TimeoutError'); }, 'OPENROUTER_403_NON_API'],
+  ];
+  const fetch = t.mock.method(globalThis, 'fetch', () => { throw new Error('Unexpected provider call'); });
+  for (const [reportReply, keyReply, expected] of cases) {
+    fetch.mock.mockImplementationOnce(reportReply);
+    fetch.mock.mockImplementationOnce(keyReply, fetch.mock.callCount() + 1);
+    const id = crypto.randomUUID();
+    const response = await handleReports(testRequest(id), env, {});
+    const text = await response.text();
+    const { report } = JSON.parse(text);
+    assert.deepEqual([report.status, report.error_code, report.result_json], ['failed', expected, null]);
+    assert.ok(!text.includes(privateText) && !text.includes(token));
+    assert.ok(!JSON.stringify(sql.prepare('SELECT * FROM reports WHERE id=?').get(id)).includes(privateText));
+    const retry = await handleReports(testRequest(id), env, {});
+    assert.equal((await retry.json()).report.error_code, expected);
+  }
+  assert.equal(fetch.mock.callCount(), 2 * cases.length);
+  for (const [index, { arguments: [url, options] }] of fetch.mock.calls.entries()) {
+    assert.equal(url, index % 2 === 0 ? 'https://openrouter.ai/api/v1/chat/completions' : 'https://openrouter.ai/api/v1/key');
+    assert.equal(options.method, index % 2 === 0 ? 'POST' : 'GET');
+    assert.equal(options.redirect, 'manual');
+    assert.equal(options.headers.Authorization, `Bearer ${token}`);
+    if (index % 2) assert.ok(options.signal instanceof AbortSignal && !options.body);
+  }
+});
+
+test('recognized OpenRouter denials and confirmed challenges skip the credential check', async t => {
+  const { env } = fixture(t);
+  let cancelled = false;
+  const challenge = new Response(new ReadableStream({ cancel() { cancelled = true; } }), {
+    status: 403, headers: { 'cf-mitigated': 'challenge', 'Content-Type': 'text/html' },
+  });
+  const fetch = t.mock.method(globalThis, 'fetch', () => { throw new Error('Unexpected provider call'); });
+  fetch.mock.mockImplementationOnce(() => challenge);
+  const challenged = await handleReports(testRequest(), env, {});
+  assert.equal((await challenged.json()).report.error_code, 'OPENROUTER_403_CHALLENGE');
+  assert.equal(cancelled, true);
+
+  fetch.mock.mockImplementationOnce(() => Response.json({ error: { metadata: { error_type: 'permission_denied' } } }, { status: 403 }));
+  const denied = await handleReports(testRequest(), env, {});
+  assert.equal((await denied.json()).report.error_code, 'OPENROUTER_403_PERMISSION');
+  assert.equal(fetch.mock.callCount(), 2);
 });
 
 test('the chosen connection is encrypted, its destination binds the token, and a provider error stays with it', async t => {

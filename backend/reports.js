@@ -5,6 +5,9 @@ const json = (body, status = 200) => Response.json(body, { status, headers: { 'C
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const day = /^\d{4}-\d{2}-\d{2}$/;
 const iso = d => d.toISOString().slice(0, 10);
+const GENERIC_FORBIDDEN = 'PROVIDER_HTTP_403';
+const OPENROUTER_NON_API = 'OPENROUTER_403_NON_API';
+const OPENROUTER_CHALLENGE = 'OPENROUTER_403_CHALLENGE';
 const openRouterBudgetErrors = new Map([
   ['openrouter_key_limit', 'OPENROUTER_403_KEY_LIMIT'],
   ['openrouter_workspace_budget', 'OPENROUTER_403_WORKSPACE_BUDGET'],
@@ -132,16 +135,19 @@ function openRouterForbiddenReason(error) {
 
   const message = typeof error?.message === 'string' ? error.message.slice(0, 512) : '';
   const match = openRouterForbiddenMessageRules.find(([, patterns]) => patterns.some(pattern => pattern.test(message)));
-  return match?.[0] ?? (type === 'permission_denied' ? 'OPENROUTER_403_PERMISSION' : 'PROVIDER_HTTP_403');
+  return match?.[0] ?? (type === 'permission_denied' ? 'OPENROUTER_403_PERMISSION' : GENERIC_FORBIDDEN);
 }
 
-async function diagnoseOpenRouterForbidden(response) {
-  const defaultError = 'PROVIDER_HTTP_403';
-  const reader = response.body?.getReader();
-  if (!reader) return defaultError;
+function discardBody(response) {
+  void response.body?.cancel().catch(() => {});
+}
 
-  // Upstream errors can include quoted prompts or provider credentials. Inspect only
-  // a small JSON body and return a fixed code. Discard every upstream field.
+async function readDiagnosticBody(response) {
+  const reader = response.body?.getReader();
+  if (!reader) return null;
+
+  // Upstream responses can include quoted prompts or key details. Keep only a
+  // bounded body in memory for classification.
   const bytes = new Uint8Array(8192);
   let length = 0;
   let fullyRead = false;
@@ -150,18 +156,66 @@ async function diagnoseOpenRouterForbidden(response) {
       const { value, done } = await reader.read();
       if (done) {
         fullyRead = true;
-        const body = JSON.parse(new TextDecoder().decode(bytes.subarray(0, length)));
-        return openRouterForbiddenReason(body?.error);
+        return new TextDecoder().decode(bytes.subarray(0, length));
       }
-      if (length + value.byteLength > bytes.length) return defaultError;
+      if (length + value.byteLength > bytes.length) return null;
       bytes.set(value, length);
       length += value.byteLength;
     }
   } catch {
-    return defaultError;
+    return null;
   } finally {
     if (!fullyRead) void reader.cancel().catch(() => {});
     reader.releaseLock();
+  }
+}
+
+function parseDiagnosticJson(text) {
+  try { return JSON.parse(text); } catch { return null; }
+}
+
+async function classifyOpenRouterForbidden(response) {
+  if (response.headers.get('cf-mitigated') === 'challenge') {
+    discardBody(response);
+    return OPENROUTER_CHALLENGE;
+  }
+  const contentType = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase();
+  if (contentType === 'text/html' || contentType === 'application/xhtml+xml') {
+    discardBody(response);
+    return OPENROUTER_NON_API;
+  }
+  const text = await readDiagnosticBody(response);
+  if (text && /^\s*(?:<!doctype\s+html\b|<html[\s>])/i.test(text)) return OPENROUTER_NON_API;
+  return openRouterForbiddenReason(parseDiagnosticJson(text)?.error);
+}
+
+async function diagnoseOpenRouterForbidden(response, connection, isTest) {
+  const original = await classifyOpenRouterForbidden(response);
+  if (!isTest || (original !== GENERIC_FORBIDDEN && original !== OPENROUTER_NON_API)) return original;
+
+  // A credential check does not generate output and is limited to the explicit connection test.
+  try {
+    const keyResponse = await fetch(`${connection.base_url}/key`, {
+      method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(2500),
+      headers: { Authorization: `Bearer ${connection.token}`, Accept: 'application/json' },
+    });
+    if (keyResponse.headers.get('cf-mitigated') === 'challenge') {
+      discardBody(keyResponse);
+      return OPENROUTER_CHALLENGE;
+    }
+    if (keyResponse.status === 403) {
+      const reason = await classifyOpenRouterForbidden(keyResponse);
+      return reason === GENERIC_FORBIDDEN || reason === OPENROUTER_NON_API ? 'OPENROUTER_403_KEY_DENIED' : reason;
+    }
+    if (!keyResponse.ok) {
+      discardBody(keyResponse);
+      return keyResponse.status === 401 ? 'OPENROUTER_403_KEY_UNAUTHORIZED' : original;
+    }
+    const keyInfo = parseDiagnosticJson(await readDiagnosticBody(keyResponse));
+    if (keyInfo?.error || !keyInfo?.data || typeof keyInfo.data !== 'object' || Array.isArray(keyInfo.data)) return original;
+    return original === OPENROUTER_NON_API ? 'OPENROUTER_403_NON_API_KEY_OK' : 'OPENROUTER_403_CHAT_KEY_OK';
+  } catch {
+    return original;
   }
 }
 
@@ -223,9 +277,12 @@ async function reserve(request, env, snapshotFn, isTest) {
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${connection.token}` },
       body: JSON.stringify(payload),
     });
-    if (response.status >= 300 && response.status < 400) error = 'PROVIDER_REDIRECT';
-    else if (response.status === 403 && connection.provider === 'openrouter') error = await diagnoseOpenRouterForbidden(response);
-    else if (!response.ok) error = `PROVIDER_HTTP_${response.status}`;
+    if (response.status === 403 && connection.provider === 'openrouter') {
+      error = await diagnoseOpenRouterForbidden(response, connection, isTest);
+    } else if (!response.ok) {
+      discardBody(response);
+      error = response.status >= 300 && response.status < 400 ? 'PROVIDER_REDIRECT' : `PROVIDER_HTTP_${response.status}`;
+    }
     else {
       ({ result = null, usage = null, error = null } = decodeCompletion(await response.text(), connection, snapshot, isTest));
       if (!error) outcome = 'completed';
