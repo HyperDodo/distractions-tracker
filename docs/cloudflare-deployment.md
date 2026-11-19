@@ -15,5 +15,5 @@
 - В рабочем окружении CI подготовьте конфиг для целевого Worker и D1. Локальный `wrangler.production.jsonc`, исключённый из Git, сам в CI не попадёт.
 - Используйте Node.js 24, Python 3, `npm ci` и `npm test`. Для публикации вызывайте `npm run deploy` с явным `--config`, чтобы команда собрала PWA.
 - `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD` и `ACCESS_EMAIL` храните в `vars` рабочего конфига. При управлении этими переменными из Dashboard включите `keep_vars: true`.
-- `OPENROUTER_FREE_API_KEY` и `LLM_TOKEN_ENCRYPTION_KEY` храните как Worker Secrets в нужном окружении.
+- `OPENROUTER_DEFAULT_API_KEY` и `LLM_TOKEN_ENCRYPTION_KEY` храните как Worker Secrets. `OPENROUTER_DEFAULT_MODEL` задайте в Dashboard. Оставьте `keep_vars: true`, чтобы публикация сохраняла переменные Dashboard.
 - Для миграций D1 используйте отдельный шаг после резервного копирования. У тестовых веток должны быть отдельные Worker, D1 и политика Access. [Workers Builds](https://developers.cloudflare.com/workers/ci-cd/builds/configuration/)

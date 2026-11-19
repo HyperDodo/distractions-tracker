@@ -31,7 +31,7 @@ cp wrangler.production.example.jsonc wrangler.production.jsonc
 
 Если Wrangler предложит перенести настройки базы в текущий конфигурационный файл, выберите **No**, поскольку рабочий конфиг создаётся из шаблона. В `wrangler.production.jsonc` подставьте UUID из вывода вместо `REPLACE_WITH_D1_DATABASE_ID`. Оставьте привязку `DB` и имя базы `interruption-tracker`. Если выбрали другое имя базы, используйте его в файле и во всех командах D1.
 
-Шаблон ссылается на собранную PWA в `frontend/dist`. Он включает `workers.dev` и отключает адреса отдельных версий через `preview_urls: false`. Рабочий `wrangler.production.jsonc` хранится локально и исключён из Git. Во всех командах для удалённого Worker и D1 указывайте этот файл явно.
+Шаблон ссылается на собранную PWA в `frontend/dist`. Он включает `workers.dev`, отключает адреса отдельных версий через `preview_urls: false` и сохраняет переменные Dashboard при публикации через `keep_vars: true`. Рабочий `wrangler.production.jsonc` хранится локально и исключён из Git. Во всех командах для удалённого Worker и D1 указывайте этот файл явно.
 
 ```sh
 npx wrangler d1 migrations list interruption-tracker --remote --config wrangler.production.jsonc
@@ -93,15 +93,18 @@ npm run deploy -- --config wrangler.production.jsonc
 
 Модели настраиваются отдельно от облачной синхронизации. Таймер, журнал и числовая статистика работают и без ключей.
 
-### Встроенный бесплатный OpenRouter
+### Встроенный OpenRouter
 
-Выпустите отдельный API-ключ в OpenRouter. Добавьте его как секрет текущего Worker. Команда попросит вставить значение.
+Откройте **Workers & Pages → ваш Worker → Settings → Variables and Secrets → Add** и добавьте обе настройки.
 
-```sh
-npx wrangler secret put OPENROUTER_FREE_API_KEY --config wrangler.production.jsonc
-```
+| Имя | Тип | Значение |
+| --- | --- | --- |
+| `OPENROUTER_DEFAULT_API_KEY` | **Secret** | Рабочий API-ключ OpenRouter. |
+| `OPENROUTER_DEFAULT_MODEL` | **Text** | Точный ID модели из каталога OpenRouter. |
 
-В приложении откройте **Настройки → Подключение к модели**, выберите **Встроенный OpenRouter Free** и сохраните подключение. Этот режим отправляет запросы модели `openrouter/free` и зависит от квоты OpenRouter.
+Нажмите **Deploy**. Храните оба значения в Cloudflare. Для старого рабочего `wrangler.production.jsonc` добавьте `"keep_vars": true` на верхнем уровне или передавайте `--keep-vars` при публикации. Оставьте настройки модели вне `vars` файла, чтобы менять их через Dashboard. [Каталог моделей](https://openrouter.ai/models) · [Переменные Cloudflare](https://developers.cloudflare.com/workers/configuration/environment-variables/) · [Настройка keep_vars](https://developers.cloudflare.com/workers/wrangler/configuration/#source-of-truth)
+
+В приложении откройте **Настройки → Подключение к модели**, выберите **Встроенный OpenRouter** и сохраните. Разбор будет использовать заданную в Cloudflare модель по тарифу OpenRouter. Пока выбрано личное подключение, оно имеет приоритет. Установки со старым `OPENROUTER_FREE_API_KEY` используют `openrouter/free`, пока обе новые настройки отсутствуют.
 
 ### OpenRouter, CheapAI или свой провайдер
 
@@ -113,13 +116,13 @@ npx wrangler secret put LLM_TOKEN_ENCRYPTION_KEY --config wrangler.production.js
 
 Затем в **Настройки → Подключение к модели** выберите провайдера, укажите идентификатор модели и введите API-токен этого провайдера. Для своего OpenAI-совместимого API добавьте публичный HTTPS Base URL до `/chat/completions`. Например, из `https://api.provider.com/v1/chat/completions` берётся `https://api.provider.com/v1`. Нажмите **Сохранить подключение**.
 
-`OPENROUTER_FREE_API_KEY` используется только для встроенного режима. `LLM_TOKEN_ENCRYPTION_KEY` шифрует личный токен на сервере, чтобы подключение работало на обоих устройствах. Сохраняйте прежний ключ шифрования при обновлениях. Если его заменили или потеряли, введите личный токен заново. Команда `secret put` публикует новую версию Worker с заданным секретом. Секреты также можно добавить в **Workers & Pages → ваш Worker → Settings → Variables and Secrets**. [Worker Secrets](https://developers.cloudflare.com/workers/configuration/secrets/)
+`LLM_TOKEN_ENCRYPTION_KEY` шифрует личный токен на сервере, чтобы подключение работало на обоих устройствах. Сохраняйте прежний ключ шифрования при обновлениях. Если его заменили или потеряли, введите личный токен заново. Команда `secret put` публикует новую версию Worker с заданным секретом. Секреты также можно добавить в **Workers & Pages → ваш Worker → Settings → Variables and Secrets**. [Worker Secrets](https://developers.cloudflare.com/workers/configuration/secrets/)
 
-После сохранения нажмите **Проверить модель**, затем запустите разбор дня с записями. Проверка отправляет короткий текст без записей. Интерфейс показывает расход токенов и стоимость, если поставщик возвращает эти данные. Разбор передаёт активному провайдеру записи и заметки за период. Расходы при использовании своего токена определяет провайдер. Вернуться к бесплатному режиму можно через настройки.
+После сохранения нажмите **Проверить модель**, затем запустите разбор дня с записями. Проверка отправляет короткий текст без записей. Интерфейс показывает расход токенов и стоимость, если поставщик возвращает эти данные. Разбор передаёт активному провайдеру записи и заметки за период. Расходы определяет провайдер выбранной модели. Вернуться к встроенному подключению можно через настройки.
 
 ## Обновление существующей установки
 
-Сохраните текущие Worker, D1, Access-приложение и локальный `wrangler.production.jsonc`. Если обновляетесь со старой версии, сравните рабочий конфиг с шаблоном и перенесите `assets.directory: "./frontend/dist"` и флаг `global_fetch_strictly_public` в `compatibility_flags`. Сохраните собственные значения `database_id`, `name` и `vars`.
+Сохраните текущие Worker, D1, Access-приложение и локальный `wrangler.production.jsonc`. Если обновляетесь со старой версии, сравните рабочий конфиг с шаблоном и перенесите `assets.directory: "./frontend/dist"`, флаг `global_fetch_strictly_public` в `compatibility_flags` и `keep_vars: true`. Сохраните собственные значения `database_id`, `name` и `vars`.
 
 Перед миграцией проверьте релиз на отдельном Worker с тестовой D1 и своей политикой Access. В рабочем аккаунте запишите ID текущей версии и сделайте резервную копию D1. Для каждого обновления выбирайте новое имя файла. Копия содержит личные данные, поэтому храните её в защищённом месте.
 
@@ -158,10 +161,10 @@ npx wrangler rollback PREVIOUS_VERSION_ID --config wrangler.production.jsonc
 | `403 ACCESS_DENIED` | Сверьте email политики Access, учётную запись при входе и `ACCESS_EMAIL`. |
 | `SYNC_UNAVAILABLE` или «Синхронизация временно недоступна» | В Network найдите ответ `/api/sync`. Если Worker отвечает 503, проверьте привязку `DB`, UUID и применение миграций с `--remote` к этой базе. Если запроса или ответа нет, проверьте сеть и вход. Оставьте данные сайта в браузере, пока очередь изменений не отправится. |
 | После обновления журнал пуст | Проверьте UUID D1, вход в правильный Worker, выбранную дату и часовой пояс. |
-| Встроенный OpenRouter недоступен | Проверьте наличие секрета `OPENROUTER_FREE_API_KEY` у нужного Worker, выбранный режим и квоту OpenRouter. |
+| Встроенный OpenRouter недоступен | Проверьте обе настройки у нужного Worker: секрет `OPENROUTER_DEFAULT_API_KEY` и текстовую переменную `OPENROUTER_DEFAULT_MODEL`. Проверьте выбранный режим и лимит ключа. |
 | Свой токен не сохраняется или не читается | Проверьте `LLM_TOKEN_ENCRYPTION_KEY`. При замене этого секрета заново сохраните токен в настройках. |
 | Модель отвечает 401 или 429 | 401 у провайдера обычно означает неверный токен. При 429 проверьте лимиты и квоты. Для своего API проверьте также Base URL и идентификатор модели. |
-| OpenRouter возвращает HTTP 403, в том числе на `openrouter/free` | Проверьте лимит сохранённого API-ключа, бюджет рабочего пространства и правила доступа в OpenRouter. Когда провайдер сообщает причину в распознаваемом формате, приложение показывает, где искать ограничение. При выборе `openrouter/free` в личном подключении используется сохранённый токен. Встроенный режим использует свой ключ `OPENROUTER_FREE_API_KEY`. [Ключи OpenRouter](https://openrouter.ai/settings/keys) · [Ошибки OpenRouter](https://openrouter.ai/docs/api/reference/errors-and-debugging) |
+| OpenRouter возвращает HTTP 403, в том числе на `openrouter/free` | Проверьте лимит активного API-ключа, бюджет рабочего пространства и правила доступа в OpenRouter. Когда провайдер сообщает причину в распознаваемом формате, приложение показывает, где искать ограничение. При выборе `openrouter/free` в личном подключении используется сохранённый токен. Встроенное подключение использует ключ Worker. [Ключи OpenRouter](https://openrouter.ai/settings/keys) · [Ошибки OpenRouter](https://openrouter.ai/docs/api/reference/errors-and-debugging) |
 | Провайдер вернул перенаправление или некорректный ответ API | Проверьте конечный HTTPS Base URL и поддержку Chat Completions. Адрес должен вести прямо к API, а ответ должен содержать JSON Chat Completions. |
 
 ## Локальная разработка
