@@ -148,6 +148,81 @@ test('a known bad provider response stays distinct from invalid model output and
   assert.equal(fetch.mock.callCount(), responses.length);
 });
 
+test('OpenRouter 403 details become safe codes without rerouting or retaining upstream text', async t => {
+  const { sql, env } = fixture(t);
+  const ownToken = 'personal-openrouter-test-token';
+  const configured = await handleLlmConfig(configRequest('PUT', {
+    provider: 'openrouter', model: 'openrouter/free', token: ownToken,
+  }), env);
+  assert.equal(configured.status, 200);
+
+  const secretDetails = 'upstream-private-authorization-and-prompt';
+  const cases = [
+    [{ limit_source: 'openrouter_key_limit' }, 'Forbidden', 'OPENROUTER_403_KEY_LIMIT'],
+    [{ limit_source: 'openrouter_workspace_budget' }, 'Forbidden', 'OPENROUTER_403_WORKSPACE_BUDGET'],
+    [{ limit_source: 'openrouter_guardrail_budget' }, 'Forbidden', 'OPENROUTER_403_GUARDRAIL_BUDGET'],
+    [{}, 'Budget limit exceeded (weekly limit).', 'OPENROUTER_403_BUDGET'],
+    [{ error_type: 'permission_denied' }, 'Forbidden', 'OPENROUTER_403_PERMISSION'],
+    [{}, 'This model is not allowed by the workspace.', 'OPENROUTER_403_PERMISSION'],
+    [{ error_type: 'content_policy_violation' }, 'Forbidden', 'OPENROUTER_403_SAFETY'],
+    [{ error_type: 'refusal' }, 'Forbidden', 'OPENROUTER_403_SAFETY'],
+    [{ reasons: ['safety'], flagged_input: secretDetails }, 'Forbidden', 'OPENROUTER_403_SAFETY'],
+    [{ error_type: 'permission_denied' }, 'Request blocked: prompt injection patterns detected', 'OPENROUTER_403_SAFETY'],
+    [{ error_type: 'permission_denied' }, 'This request arrived on the global data region, but the key’s workspace permits requests only on these OpenRouter hostnames: eu.openrouter.ai.', 'OPENROUTER_403_REGION'],
+    [{}, 'IP address is not on the allowlist.', 'OPENROUTER_403_REGION'],
+    [{ limit_source: 'unrecognized_budget', error_type: 'constructor' }, 'Forbidden', 'PROVIDER_HTTP_403'],
+  ];
+  const fetch = t.mock.method(globalThis, 'fetch', () => { throw new Error('Unexpected provider call'); });
+  for (const [metadata, message, expected] of cases) {
+    fetch.mock.mockImplementationOnce(() => Response.json({ error: {
+      code: 403, message: `${message} ${secretDetails}`, metadata: { ...metadata, raw: secretDetails },
+    } }, { status: 403 }));
+    const id = crypto.randomUUID();
+    const response = await handleReports(reportRequest(id), env, reportContext);
+    const text = await response.text();
+    const { report } = JSON.parse(text);
+    assert.deepEqual([report.status, report.error_code, report.result_json], ['failed', expected, null]);
+    assert.ok(!text.includes(secretDetails) && !text.includes(ownToken));
+    assert.ok(!JSON.stringify(sql.prepare('SELECT * FROM reports WHERE id=?').get(id)).includes(secretDetails));
+    const retry = await handleReports(reportRequest(id), env, reportContext);
+    assert.equal((await retry.json()).report.error_code, expected);
+  }
+  assert.equal(fetch.mock.callCount(), cases.length);
+  assert.ok(fetch.mock.calls.every(({ arguments: [url, options] }) =>
+    url === 'https://openrouter.ai/api/v1/chat/completions' && options.headers.Authorization === `Bearer ${ownToken}`));
+});
+
+test('unreadable or oversized 403s and non-OpenRouter 403s remain generic failures', async t => {
+  const { env } = fixture(t);
+  const providerBody = { error: { code: 403, metadata: { limit_source: 'openrouter_key_limit' } } };
+  let cancelled = false;
+  const oversizedBytes = new TextEncoder().encode(JSON.stringify({ ...providerBody, padding: '0'.repeat(8192) }));
+  const unreadable = new Response(new ReadableStream({ start(stream) { stream.error(new Error('unreadable')); } }), { status: 403 });
+  const oversized = new Response(new ReadableStream({
+    start(stream) { stream.enqueue(oversizedBytes); },
+    cancel() { cancelled = true; },
+  }), { status: 403 });
+
+  const fetch = t.mock.method(globalThis, 'fetch', () => { throw new Error('Unexpected provider call'); });
+  for (const body of [new Response('<html>Forbidden</html>', { status: 403 }), unreadable, oversized]) {
+    fetch.mock.mockImplementationOnce(() => body);
+    const response = await handleReports(testRequest(), env, {});
+    const { report } = await response.json();
+    assert.deepEqual([report.status, report.error_code], ['failed', 'PROVIDER_HTTP_403']);
+  }
+  assert.equal(cancelled, true);
+
+  const configured = await handleLlmConfig(configRequest('PUT', {
+    provider: 'cheapai', model: 'model-c', token: 'cheapai-test-token',
+  }), env);
+  assert.equal(configured.status, 200);
+  fetch.mock.mockImplementationOnce(() => Response.json(providerBody, { status: 403 }));
+  const response = await handleReports(testRequest(), env, {});
+  const { report } = await response.json();
+  assert.deepEqual([report.status, report.error_code], ['failed', 'PROVIDER_HTTP_403']);
+  assert.equal(fetch.mock.callCount(), 4);
+});
+
 test('the chosen connection is encrypted, its destination binds the token, and a provider error stays with it', async t => {
   const { sql, env } = fixture(t);
   const token = 'owned-provider-test-token';

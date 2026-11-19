@@ -161,6 +161,7 @@ npx wrangler rollback PREVIOUS_VERSION_ID --config wrangler.production.jsonc
 | Встроенный OpenRouter недоступен | Проверьте наличие секрета `OPENROUTER_FREE_API_KEY` у нужного Worker, выбранный режим и квоту OpenRouter. |
 | Свой токен не сохраняется или не читается | Проверьте `LLM_TOKEN_ENCRYPTION_KEY`. При замене этого секрета заново сохраните токен в настройках. |
 | Модель отвечает 401 или 429 | 401 у провайдера обычно означает неверный токен. При 429 проверьте лимиты и квоты. Для своего API проверьте также Base URL и идентификатор модели. |
+| OpenRouter возвращает HTTP 403, в том числе на `openrouter/free` | Проверьте лимит сохранённого API-ключа, бюджет рабочего пространства и правила доступа в OpenRouter. Когда провайдер сообщает причину в распознаваемом формате, приложение показывает, где искать ограничение. При выборе `openrouter/free` в личном подключении используется сохранённый токен. Встроенный режим использует свой ключ `OPENROUTER_FREE_API_KEY`. [Ключи OpenRouter](https://openrouter.ai/settings/keys) · [Ошибки OpenRouter](https://openrouter.ai/docs/api/reference/errors-and-debugging) |
 | Провайдер вернул перенаправление или некорректный ответ API | Проверьте конечный HTTPS Base URL и поддержку Chat Completions. Адрес должен вести прямо к API, а ответ должен содержать JSON Chat Completions. |
 
 ## Локальная разработка

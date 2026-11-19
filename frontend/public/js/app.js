@@ -175,8 +175,15 @@ function reportError(code) {
   if (/^PROVIDER_HTTP_3\d\d$/.test(code || '')) code = 'PROVIDER_REDIRECT';
   return ({
     PROVIDER_HTTP_401: 'Провайдер отклонил токен.',
-    PROVIDER_HTTP_403: 'Провайдер отказал в доступе.',
+    PROVIDER_HTTP_403: 'Провайдер отказал в доступе (HTTP 403). Проверьте права и лимиты API-ключа.',
     PROVIDER_HTTP_429: 'Провайдер ограничил запросы. Попробуйте позже.',
+    OPENROUTER_403_KEY_LIMIT: 'Исчерпан лимит API-ключа OpenRouter. Проверьте бюджет ключа в OpenRouter.',
+    OPENROUTER_403_WORKSPACE_BUDGET: 'Исчерпан бюджет рабочего пространства OpenRouter. Проверьте его лимиты.',
+    OPENROUTER_403_GUARDRAIL_BUDGET: 'Исчерпан бюджет правила OpenRouter. Проверьте лимит в разделе Guardrails.',
+    OPENROUTER_403_BUDGET: 'OpenRouter сообщил об исчерпанном бюджете. Проверьте лимиты ключа и рабочего пространства.',
+    OPENROUTER_403_PERMISSION: 'OpenRouter ограничил доступ для этого запроса. Проверьте права ключа и разрешённые модели.',
+    OPENROUTER_403_SAFETY: 'OpenRouter или поставщик модели заблокировал запрос правилом безопасности. Проверьте политики в OpenRouter.',
+    OPENROUTER_403_REGION: 'OpenRouter ограничил доступ для региона или IP сервера, который отправил запрос.',
     TIMEOUT: 'Провайдер не ответил вовремя.',
     PROVIDER_UNREACHABLE: 'Не удалось связаться с провайдером.',
     PROVIDER_REDIRECT: 'Провайдер вернул перенаправление. Проверьте адрес API.',
